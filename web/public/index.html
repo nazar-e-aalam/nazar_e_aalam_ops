@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Downloads</title>
+    <meta
+      name="description"
+      content="Download the latest apps and every previous version."
+    />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <script src="/applications/static/shared/theme.js"></script>
+    <link
+      rel="stylesheet"
+      href="/applications/static/shared/theme.css?v={{V}}"
+    />
+    <link
+      rel="stylesheet"
+      href="/applications/static/public/public.css?v={{V}}"
+    />
+  </head>
+  <body>
+    <header class="pbar">
+      <div class="wrapw row">
+        <a class="pbrand" href="/applications"
+          ><img src="/favicon.svg" alt="" width="28" height="28" /><span
+            id="site"
+            >Downloads</span
+          ></a
+        >
+        <span class="sp"></span>
+        <button
+          class="btn ghost sm"
+          id="tbtn"
+          aria-label="Toggle light or dark theme"
+        ></button>
+      </div>
+    </header>
+    <main class="wrapw" id="root">
+      <div class="skel" style="height: 220px; border-radius: 20px"></div>
+    </main>
+    <footer class="wrapw pfoot">
+      Downloads are delivered through a fast GitHub mirror. Where a SHA-256 is
+      shown, use it to verify your file.
+    </footer>
+    <script src="/applications/static/public/public.js?v={{V}}"></script>
+  </body>
+</html>

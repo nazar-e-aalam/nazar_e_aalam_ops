@@ -1,0 +1,56 @@
+/* "Workflow Roots" graph: styling carried over from the original dummy, made reusable */
+.roots{position:relative;overflow:hidden;border:1px solid var(--line);border-radius:18px;background:var(--canvas);isolation:isolate;touch-action:none;user-select:none}
+.roots::before{content:"";position:absolute;inset:0;pointer-events:none;z-index:-1;
+  background:radial-gradient(600px 380px at 10% 50%,color-mix(in srgb,var(--yellow) 7%,transparent),transparent 70%),radial-gradient(circle,var(--grid) 1px,transparent 1.3px) 0 0/30px 30px}
+.r-svg{position:absolute;inset:0;width:100%;height:100%;cursor:grab}.r-svg.drag{cursor:grabbing}
+.roots.static .r-svg{cursor:default;pointer-events:none}
+
+.r-edges path,.r-parts{fill:none}
+.edge path{fill:none;stroke-linecap:round;transition:stroke .6s}
+.edge .t{stroke-width:.8;opacity:.45}
+.edge.queued path{stroke:var(--idle)}
+.edge.queued .m{stroke-dasharray:1.5 8;animation:r-flow 2.6s linear infinite}
+.edge.running path{stroke:var(--yellow)}.edge.success path{stroke:var(--green)}.edge.failed path{stroke:var(--red)}
+.edge.failed .m{stroke-dasharray:3 8}.edge.cancelled path{stroke:var(--warn)}.edge.skipped path{stroke:var(--idle);opacity:.45}
+.edge.link .m{stroke-dasharray:2 7;opacity:.5;animation:none}
+.pt{fill:var(--yellow);filter:drop-shadow(0 0 4px var(--yellow))}
+
+.nd{--c:var(--idle)}
+.nd.running{--c:var(--yellow)}.nd.success{--c:var(--green)}.nd.failed{--c:var(--red)}.nd.cancelled{--c:var(--warn)}.nd.skipped{--c:var(--idle)}
+.nd.has{cursor:pointer}.roots:not(.static) .nd{cursor:pointer}
+.core{fill:var(--c);transition:fill .5s;filter:drop-shadow(0 0 calc(5px*var(--glow)) var(--c))}
+.nd.queued .core,.nd.skipped .core{fill:var(--canvas);stroke:var(--c);stroke-width:1.4;filter:none}
+.nd.skipped .core{stroke-dasharray:2 2}
+.sring{fill:none;stroke:var(--c);stroke-width:1;opacity:.5;transition:stroke .5s}
+.ring,.spin,.cring,.boom,.selring{fill:none;opacity:0;transform-box:fill-box;transform-origin:center}
+.nd.running .core{animation:r-beat 1.3s ease-in-out infinite;transform-box:fill-box;transform-origin:center}
+.nd.running .spin{opacity:1;stroke:var(--yellow);stroke-width:1.6;stroke-linecap:round;stroke-dasharray:14 60;animation:r-spin .9s linear infinite}
+.nd.running .ring{opacity:1;stroke:var(--yellow);stroke-width:1;animation:r-ripple 2s ease-out infinite}
+.nd.col .cring{opacity:.9;stroke:var(--mute);stroke-width:1;stroke-dasharray:1.5 3.5}
+.nd.boom .boom{stroke:var(--red);stroke-width:1.5;animation:r-ripple 1s ease-out 1}
+.nd.failed .core{animation:r-shake .5s 1}
+.nd.sel .selring{opacity:1;stroke:var(--accent-text);stroke-width:1.6}
+.roots text{text-anchor:middle;paint-order:stroke;stroke:var(--canvas);stroke-width:4px;stroke-linejoin:round;pointer-events:none;transition:stroke .5s}
+.nm{font:600 11.5px var(--sans);fill:var(--text)}.nm.main{font-size:13.5px;font-weight:700}.nm.job{font-weight:500;fill:var(--mute);font-size:10.5px}
+.mt{font:400 9px var(--mono);fill:var(--mute)}
+.more{font:500 9.5px var(--mono);fill:var(--accent-text);text-anchor:start!important}
+
+.r-tip{position:absolute;left:0;top:0;z-index:5;pointer-events:none;width:240px;padding:12px 14px;background:var(--panel);backdrop-filter:blur(14px);border:1px solid var(--line2);border-radius:14px;
+  opacity:0;transition:opacity .16s;font-size:12px;display:flex;flex-direction:column;gap:8px;box-shadow:var(--shadow)}
+.r-tip.on{opacity:1}.r-tip .r{display:flex;align-items:center;gap:8px}.r-tip .t{font-weight:700;font-size:13px;margin-right:auto;word-break:break-word}
+.r-tip .k{font:500 9.5px var(--mono);color:var(--mute);border:1px solid var(--line);padding:2px 7px;border-radius:99px}
+.r-tip .s{display:flex;align-items:center;gap:7px;color:var(--mute);font:400 11px var(--mono)}.r-tip .s b{width:7px;height:7px;border-radius:50%}
+.r-tip .n{color:var(--mute);font-size:11px;line-height:1.55}.r-tip .n em{font-style:normal;color:var(--text)}
+
+.r-tools{position:absolute;top:10px;right:10px;z-index:6;display:flex;gap:4px;padding:4px;background:var(--panel);backdrop-filter:blur(12px);border:1px solid var(--line);border-radius:12px}
+.r-tools button{border:0;background:transparent;padding:6px 10px;border-radius:8px;font-weight:600;font-size:12px;cursor:pointer;color:var(--text)}.r-tools button:hover{background:var(--card-hi)}
+.r-tools input{width:130px;padding:5px 10px;border-radius:8px;font-size:12px}
+.r-legend{position:absolute;left:14px;bottom:10px;z-index:6;display:flex;gap:12px;font-size:11px;color:var(--mute);flex-wrap:wrap;pointer-events:none}
+.r-legend span{display:flex;align-items:center;gap:6px}.r-legend b{width:7px;height:7px;border-radius:50%}
+.r-hint{position:absolute;right:14px;bottom:10px;z-index:6;font-size:11px;color:var(--mute);pointer-events:none}
+@media(max-width:720px){.r-hint,.r-tools input{display:none}}
+
+@keyframes r-spin{to{transform:rotate(360deg)}}@keyframes r-flow{to{stroke-dashoffset:-19}}
+@keyframes r-beat{50%{transform:scale(1.2)}}@keyframes r-ripple{0%{transform:scale(1);opacity:.6}100%{transform:scale(3.4);opacity:0}}
+@keyframes r-shake{20%{transform:translateX(-2.5px)}40%{transform:translateX(2.5px)}60%{transform:translateX(-1.5px)}80%{transform:translateX(1.5px)}}
+@media(prefers-reduced-motion:reduce){.nd *,.edge *{animation:none!important}}
