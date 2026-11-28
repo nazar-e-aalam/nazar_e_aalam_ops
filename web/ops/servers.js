@@ -139,12 +139,12 @@
     function sSetup() {
       var st = T.bootstrap, pw = h("input", { type: "password", placeholder: "sudo password (only if needed)", autocomplete: "off" });
       body.replaceChildren(h("h3", null, local ? "2. Server setup" : "4. Server setup"),
-        h("p", { class: "sub" }, "After sudo access is granted the panel prepares the machine by itself: installs Python, venv, pip, git, curl and build tools, checks the Python version, creates the deploy folder, then clones your repository, installs its dependencies and runs your test command once. If anything fails you get a notification (and an email when email is set up)."),
+        h("p", { class: "sub" }, local ? "The root installer provisions packages. This setup checks them, prepares writable folders and runs a test build without sudo." : "After sudo access is granted the panel prepares the machine by itself: installs Python, venv, pip, git, curl and build tools, checks the Python version, creates the deploy folder, then clones your repository, installs its dependencies and runs your test command once. If anything fails you get a notification (and an email when email is set up)."),
         st ? note(st.tested ? "info" : "warn", st.tested ? "Set up and tested" : "Set up", "Finished " + F.ago(st.at) + (st.python ? ". Python: " + st.python + " (" + String(st.version || "") + ")" : "") + (st.tested ? ". The test build passed." : ". The test build was skipped (add a GitHub token in Settings, then run it again).")) : note("info", "Not run yet", "Press the button below, or grant sudo access in the access check step and it starts by itself."),
-        can("admin") ? h("div", { class: "row wrap" }, pw, h("button", { class: "btn primary", type: "button", onclick: function (e) {
+        can("admin") ? h("div", { class: "row wrap" }, local ? null : pw, h("button", { class: "btn primary", type: "button", onclick: function (e) {
           busy(e.target.closest("button"), api("POST", "/api/targets/" + T.id + "/bootstrap", { password: pw.value }).then(function (r) { pw.value = ""; O.go("deploy/" + r.id); }).catch(fail));
         } }, icon("rocket"), st ? "Run setup again" : "Set up this server")) : null,
-        h("div", { class: "hint" }, "The sudo password is used once, kept in memory only and never stored or written to the log. Leave it empty if the user is root or already has passwordless sudo."),
+        h("div", { class: "hint" }, local ? "No sudo password is needed for local setup. Run the root installer if dependencies are missing." : "The sudo password is used once, kept in memory only and never stored or written to the log. Leave it empty if the user is root or already has passwordless sudo."),
         nav(true, "Continue", null, "Skip"));
     }
 

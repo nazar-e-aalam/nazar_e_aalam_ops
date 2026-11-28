@@ -5,7 +5,7 @@ One small FastAPI service that gives you:
 | Where | What |
 |---|---|
 | `ops.<your-domain>` | **Ops panel** (login): run GitHub workflows with inputs, watch the whole workflow as a live "roots" graph, deploy the panel repo per commit, manage the admin panel's `.env`, publish app builds, users, audit log |
-| `<your-domain>/applications` | **Public downloads**: every app and every version, GitHub-releases style, no login |
+| `ops.<your-domain>/applications` | **Public downloads**: every app and every version, GitHub-releases style, no login |
 
 Plain HTML/CSS/JS on the front, FastAPI + SQLAlchemy on the back with MySQL / MariaDB (installed and created for you). No build step, no Node. All logs go to the terminal (or `journalctl`), never to files.
 
@@ -25,7 +25,7 @@ The installer does everything, and is safe to re-run:
 1. installs `python3-venv`, `git`, `nginx`, **MariaDB** (and `certbot` with `--ssl`), starts MariaDB and **creates the database + user** with a random password
 2. creates a `nazar` system user and installs the app into `/opt/nazar-ops` with its own virtualenv
 3. writes `.env` (domain, seeded admin login, `OPS_HTTPS`)
-4. **generates and installs** the systemd services (`nazar-ops`, `nazar-panel`), the sudoers rule that lets the panel restart only that one service, and the nginx site (ops panel on `ops.example.com`, downloads on `example.com/applications`, your API/admin on `example.com`)
+4. **generates and installs** the systemd services (`nazar-ops`, `nazar-panel`), the sudoers rule that lets the panel restart only that one service, and the nginx site (ops panel on `ops.example.com`, downloads on `ops.example.com/applications`, your API/admin on `example.com`)
 5. enables and starts the services, reloads nginx, and gets the HTTPS certificate
 6. prints the URLs and the generated admin password (once)
 
@@ -144,7 +144,7 @@ Passwords are scrypt-hashed, sessions are HttpOnly cookies (SameSite=Lax, Secure
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OPS_ROOT_DOMAIN` | `localhost` | your domain; public site at `/applications` |
+| `OPS_ROOT_DOMAIN` | `localhost` | your API/admin domain; public site on the Ops subdomain |
 | `OPS_SUBDOMAIN` | `ops` | panel host is `<sub>.<root>` |
 | `OPS_HTTPS` | `false` locally, `true` on a domain | marks cookies Secure and sends HSTS; `false` only locally |
 | `OPS_ADMIN_EMAIL` / `OPS_ADMIN_PASSWORD` / `OPS_ADMIN_NAME` | | seeded admin (only when the DB is empty) |

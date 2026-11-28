@@ -123,7 +123,7 @@ ok "using $($PY --version)"
 say "Installing system packages"
 if command -v apt-get >/dev/null; then
   export DEBIAN_FRONTEND=noninteractive
-  PKGS="python3-venv python3-pip git curl dnsutils ca-certificates openssl"
+  PKGS="python3 python3-venv python3-pip git curl tar dnsutils ca-certificates openssl build-essential python3-dev libffi-dev libssl-dev"
   [ "$NO_NGINX" = 1 ] || PKGS="$PKGS nginx"
   [ "$SSL" = 1 ] && PKGS="$PKGS certbot python3-certbot-nginx"
   apt-get update -qq && apt-get install -y -qq $PKGS >/dev/null
@@ -274,7 +274,8 @@ env_set "$ENVF" OPS_SUBDOMAIN "$SUB"
 say "Database"
 setup_database "$ENVF" || die "database setup failed (see above)"
 chmod 600 "$ENVF"; chown "$RUN_USER": "$ENVF"
-mkdir -p "$DEPLOY_ROOT"; chown "$RUN_USER": "$DEPLOY_ROOT"
+mkdir -p "$DEPLOY_ROOT/releases" "$DEPLOY_ROOT/shared/venvs"
+chown "$RUN_USER": "$DEPLOY_ROOT" "$DEPLOY_ROOT/releases" "$DEPLOY_ROOT/shared" "$DEPLOY_ROOT/shared/venvs"
 
 say "Generating systemd, sudoers and nginx configuration"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
@@ -306,7 +307,7 @@ if [ "$NO_NGINX" != 1 ]; then
         -d "$SUB.$DOMAIN" \
         --non-interactive \
         --agree-tos \
-        --keep-until-expiring \
+        --expand --keep-until-expiring \
         --redirect \
         -m "$EMAIL"; then
 
@@ -360,13 +361,13 @@ SCHEME=http
 echo
 echo "------------------------------------------------------------------"
 echo " Ops panel : $SCHEME://$SUB.$DOMAIN"
-echo " Public    : $SCHEME://$SUB.$DOMAIN/apps"
+echo " Public    : $SCHEME://$SUB.$DOMAIN/applications"
 echo " Login     : $ADMIN_EMAIL"
 if [ "$GENERATED_PW" = 1 ]; then echo " Password  : $ADMIN_PASSWORD   <- shown once, change it in Settings > Account"
 else echo " Password  : (the one in $ENVF / the one you passed)"; fi
 echo
-echo " Next: open the panel > Settings > GitHub, paste a token, then Servers > This server > Grant access."
-echo "       Granting sudo starts the automatic setup (packages, Python check, test build) and alerts you if it fails."
+echo " Next: open the panel > Settings > GitHub, paste a token, then Servers > This server > Server setup."
+echo "       Local setup checks the packages installed here, Python and the test build without broad sudo."
 echo "       Set up email under Settings > Email to get failure alerts in your inbox."
 if [ "$SSL_READY" = 1 ]; then
     echo " HTTPS     : enabled and verified"

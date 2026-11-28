@@ -64,7 +64,7 @@ def resolve(host: str) -> list:
 def dns_check(domain: str, sub: str, ip: str) -> list:
     """Look up the root + panel hostnames and compare with the server IP."""
     out = []
-    for host, purpose in ((domain, "Public downloads page"), (f"{sub}.{domain}", "Ops panel")):
+    for host, purpose in ((domain, "API / admin panel"), (f"{sub}.{domain}", "Ops panel and public downloads")):
         found = resolve(host)
         if not found:
             st, msg = "missing", "No DNS record found yet. Add it at your domain provider, then check again (can take 1 to 30 minutes)."

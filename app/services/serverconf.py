@@ -57,7 +57,7 @@ SUDOERS = """# Lets the ops panel restart ONLY the panel service, without a pass
 {{USER}} ALL=(root) NOPASSWD: /usr/bin/systemctl restart {{SERVICE}}, /bin/systemctl restart {{SERVICE}}, /usr/bin/systemctl is-active {{SERVICE}}, /bin/systemctl is-active {{SERVICE}}
 """
 
-NGINX = """# Nazar Ops: ops panel on {{OPS_HOST}}, public downloads on {{DOMAIN}}/applications, your API/admin on {{DOMAIN}}
+NGINX = """# Nazar Ops: ops panel on {{OPS_HOST}}, public downloads on {{OPS_HOST}}/applications, your API/admin on {{DOMAIN}}
 # HTTPS: run  sudo certbot --nginx -d {{DOMAIN}} -d {{OPS_HOST}}  (certbot edits this file for you).
 
 server {
@@ -71,6 +71,8 @@ server {
 
     location / {
         proxy_pass http://127.0.0.1:{{OPS_PORT}};
+        proxy_http_version 1.1;
+        proxy_buffering off;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -84,20 +86,6 @@ server {
     server_name {{DOMAIN}};
 
     client_max_body_size 50m;
-
-    # public downloads (served by Nazar Ops)
-    location /applications {
-        proxy_pass http://127.0.0.1:{{OPS_PORT}};
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_buffering off;                   # big downloads do not fill nginx temp files
-    }
-    location = /favicon.svg {
-        proxy_pass http://127.0.0.1:{{OPS_PORT}};
-        proxy_set_header Host $host;
-    }
 
     # everything else: your nazar_e_aalam_panel (API + admin panel)
     location / {
@@ -153,7 +141,7 @@ def render(domain: str, sub: str = "ops", user: str = "nazar", ops_dir: str = "/
         dict(key="sudoers", name="nazar-ops (sudoers)", path="/etc/sudoers.d/nazar-ops", mode="440",
              description="Allows the panel to restart only that one service", content=_fill(SUDOERS, v)),
         dict(key="nginx.conf", name="nginx site", path=nginx_path, mode="644",
-             description="Routes ops.<domain>, <domain>/applications and <domain>", content=_fill(NGINX, v)),
+             description="Routes ops.<domain> (including /applications) and <domain>", content=_fill(NGINX, v)),
     ]
     cmds = [f"sudo useradd --system --create-home --shell /usr/sbin/nologin {user}   # once",
             f"sudo mkdir -p {deploy_root} && sudo chown {user}: {deploy_root}",

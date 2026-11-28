@@ -46,7 +46,7 @@
         prev = h("div", { class: "wz-preview" });
       var https = h("input", { type: "checkbox" }); https.checked = wz.https;
       function upd() { wz.domain = dom.value; wz.sub = sub.value; wz.ip = ip.value; wz.https = https.checked; store(wz); var x = hosts();
-        prev.replaceChildren(h("div", null, h("span", { class: "k" }, "Ops panel"), h("code", { class: "inline" }, x.root ? x.scheme + "://" + x.panel : "…")), h("div", null, h("span", { class: "k" }, "Public downloads"), h("code", { class: "inline" }, x.root ? x.scheme + "://" + x.root + "/applications" : "…")), h("div", null, h("span", { class: "k" }, "Your API / admin"), h("code", { class: "inline" }, x.root ? x.scheme + "://" + x.root : "…"))); }
+        prev.replaceChildren(h("div", null, h("span", { class: "k" }, "Ops panel"), h("code", { class: "inline" }, x.root ? x.scheme + "://" + x.panel : "…")), h("div", null, h("span", { class: "k" }, "Public downloads"), h("code", { class: "inline" }, x.root ? x.scheme + "://" + x.panel + "/applications" : "…")), h("div", null, h("span", { class: "k" }, "Your API / admin"), h("code", { class: "inline" }, x.root ? x.scheme + "://" + x.root : "…"))); }
       [dom, sub, ip, https].forEach(function (el) { el.addEventListener("input", upd); el.addEventListener("change", upd); }); upd();
       card.replaceChildren(h("h3", null, "1. Choose your domain"),
         h("p", { class: "sub" }, "Use a domain you own (bought from GoDaddy, Namecheap, Cloudflare, Hostinger…). You need two addresses: your main domain, and a sub-domain for this panel."),
@@ -101,7 +101,7 @@
         body.replaceChildren(
           h("div", { class: "wz-opt" }, h("div", { class: "wz-badge" }, "Easiest"), h("h4", null, "Option A: one command (Ubuntu / Debian)"),
             h("p", { class: "sub" }, "Run this on the server, inside the unzipped nazar-ops folder. It installs everything, writes the nginx + systemd files and gets the certificate."),
-            codeLine("sudo scripts/install.sh --domain " + x.root + " --email you@" + x.root + (wz.https ? " --ssl" : ""), "Command copied"),
+            codeLine("sudo scripts/install.sh --domain " + x.root + " --email you@" + x.root + (wz.https ? " --ssl" : " --no-ssl"), "Command copied"),
             h("p", { class: "hint" }, "Replace you@" + x.root + " with your real email (Let's Encrypt sends expiry notices there).")),
           h("div", { class: "wz-opt" }, h("h4", null, "Option B: manually"),
             h("p", { class: "sub" }, "1. Open ports 80 and 443 in your firewall / cloud security group.  2. Create each file below at the shown path.  3. Run the commands in order."),
@@ -135,7 +135,7 @@
       var out = h("div", { class: "col" });
       card.replaceChildren(h("h3", null, "5. Save and finish"),
         h("p", { class: "sub" }, "Last step: the settings are written to your .env file and the panel restarts once to use them."),
-        h("div", { class: "wz-sum" }, [["Main domain", x.root], ["Panel address", x.scheme + "://" + x.panel], ["Public downloads", x.scheme + "://" + x.root + "/applications"], ["Settings file", info.env_file]].map(function (r) { return h("div", null, h("span", { class: "k" }, r[0]), h("code", { class: "inline" }, r[1])); })),
+        h("div", { class: "wz-sum" }, [["Main domain", x.root], ["Panel address", x.scheme + "://" + x.panel], ["Public downloads", x.scheme + "://" + x.panel + "/applications"], ["Settings file", info.env_file]].map(function (r) { return h("div", null, h("span", { class: "k" }, r[0]), h("code", { class: "inline" }, r[1])); })),
         h("label", { class: "wz-check" }, keep, h("span", null, h("b", null, "Keep the current address working too (recommended)"), h("small", null, "After the restart the panel answers on " + x.panel + ". With this on, the address you are using right now keeps working at /ops, so you can never lock yourself out while DNS or HTTPS is still settling. Turn it off later by setting OPS_DEV=false."))),
         !info.env_writable ? note("warn", "Cannot write the .env file", "Edit " + info.env_file + " by hand: OPS_ROOT_DOMAIN=" + x.root + ", OPS_SUBDOMAIN=" + (wz.sub || "ops") + ", OPS_HTTPS=" + (wz.https ? "true" : "false") + ". Then restart the panel and press Finish.") : null,
         out,

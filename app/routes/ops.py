@@ -1123,7 +1123,7 @@ def setup_save(body: SetupBody, request: Request, user: dict = Depends(admin_onl
     changed = (d, s, bool(body.https)) != (config.ROOT_DOMAIN, config.OPS_SUBDOMAIN, bool(config.HTTPS))
     db.audit(user["email"], "setup.domain", f"{s}.{d} https={body.https}", ip_of(request))
     return {"saved": True, "env_file": path, "restart_needed": changed, "panel_host": f"{s}.{d}",
-            "ops_url": f"{'https' if body.https else 'http'}://{s}.{d}", "public_url": f"{'https' if body.https else 'http'}://{d}"}
+            "ops_url": f"{'https' if body.https else 'http'}://{s}.{d}", "public_url": f"{'https' if body.https else 'http'}://{s}.{d}"}
 
 
 @router.post("/api/setup/restart")

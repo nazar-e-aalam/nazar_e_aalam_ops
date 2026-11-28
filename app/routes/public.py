@@ -1,4 +1,4 @@
-"""Public pages served on the root domain under /applications."""
+"""Public pages served on the Ops subdomain under /applications."""
 import html as _html
 from pathlib import Path
 

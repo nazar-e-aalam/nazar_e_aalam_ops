@@ -45,7 +45,7 @@ PANEL_HOST = f"{OPS_SUBDOMAIN}.{ROOT_DOMAIN}"
 DEV = _bool("OPS_DEV", ROOT_DOMAIN == "localhost")
 HTTPS = _bool("OPS_HTTPS", not DEV)
 _scheme = "https" if HTTPS else "http"
-PUBLIC_URL = _get("OPS_PUBLIC_URL", f"{_scheme}://{ROOT_DOMAIN}").rstrip("/")
+PUBLIC_URL = _get("OPS_PUBLIC_URL", ("http://localhost:8100" if DEV and ROOT_DOMAIN == "localhost" else f"{_scheme}://{PANEL_HOST}")).rstrip("/")
 # Base address used in emailed links. Only ever taken from the server's own config, never from request headers.
 OPS_URL = _get("OPS_URL", "http://localhost:8100/ops" if DEV and ROOT_DOMAIN == "localhost" else f"{_scheme}://{PANEL_HOST}").rstrip("/")
 

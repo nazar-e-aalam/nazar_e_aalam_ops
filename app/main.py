@@ -2,7 +2,8 @@
 
 One process, two sites chosen by the Host header:
   ops.<ROOT_DOMAIN>   -> ops panel (login required)
-  anything else       -> public site under /applications
+  ops.<ROOT_DOMAIN>/applications -> public site
+  other hosts -> 404 (except local development)
 In OPS_DEV mode the panel is also reachable at /ops on any host (http://localhost:8100/ops/)."""
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -150,9 +151,17 @@ async def lifespan(_app):
     db.dispose()
 
 
-routes = [Host(config.PANEL_HOST, app=ops, name="ops-host")]
+# Dispatch public paths before the Ops catch-all, retaining separate CSPs.
+class OpsSite:
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "")
+        target = public if path == "/applications" or path.startswith("/applications/") else ops
+        await target(scope, receive, send)
+
+
+routes = [Host(config.PANEL_HOST, app=OpsSite(), name="ops-host")]
 if config.DEV:
     routes.append(Route("/ops", lambda r: RedirectResponse("/ops/", status_code=307)))
     routes.append(Mount("/ops", app=ops, name="ops-dev"))
-routes.append(Mount("/", app=public, name="public"))
+    routes.append(Mount("/", app=public, name="public"))
 app = Starlette(routes=routes, lifespan=lifespan)

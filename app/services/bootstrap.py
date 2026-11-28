@@ -69,12 +69,16 @@ def run(ctx, d: dict, cfg: dict, tg, t: dict, password: str) -> None:
     cwd = "/"
     log = ctx.log.write
 
+    local = not tg.remote
+    if local:
+        password = ""  # system service account has no sudo password
+
     # 1. access ----------------------------------------------------------------------------------------------------
     ctx.stage("access", "running")
     rc = _sh(ctx, tg, 'echo "user=$(whoami) uid=$(id -u) os=$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-$(uname -sr)}")"\n'
                       'echo "root access: $NZ_MODE, package manager: $NZ_PM"\n'
                       'if [ "$NZ_MODE" = pw ]; then printf \'%s\\n\' "$NZ_PW" | sudo -S -p "" -v || { echo "WRONG_SUDO_PASSWORD"; exit 78; }; fi\n'
-                      '[ "$NZ_MODE" != none ] || exit 77\n', password, cwd, 120, "check access")
+                      + ('true\n' if local else '[ "$NZ_MODE" != none ] || exit 77\n'), password, cwd, 120, "check access")
     if rc != 0:
         ctx.stage("access", "failed", "no root access")
         raise Failure("No root access on the server. Press Grant access and enter the user's sudo password (it is used once and never stored).")
@@ -91,9 +95,17 @@ case "$NZ_PM" in
   *) echo "No supported package manager (apt, dnf, yum). Install python3, venv, pip, git, curl and tar yourself."; exit 79;;
 esac
 '''
-    if _sh(ctx, tg, body, password, cwd, 1200, "install system packages") != 0:
+    if local:
+        body = f'''case "$NZ_PM" in
+  apt) for pkg in {APT_PKGS}; do
+         dpkg-query -W -f='${{Status}}' "$pkg" 2>/dev/null | grep -qx 'install ok installed' || {{ echo "Missing package: $pkg"; exit 1; }}
+       done;;
+  *) for cmd in python3 git curl tar; do command -v "$cmd" >/dev/null || exit 1; done;;
+esac
+'''
+    if _sh(ctx, tg, body, password, cwd, 1200, "check installed packages" if local else "install system packages") != 0:
         ctx.stage("packages", "failed")
-        raise Failure("Installing system packages failed (see the log above). Check the server has internet access and a working package mirror.")
+        raise Failure("Local dependencies missing: run the updated scripts/install.sh as an administrator." if local else "Installing system packages failed (see the log above). Check sudo permissions and package mirrors.")
     ctx.stage("packages", "success")
 
     # 3. python ----------------------------------------------------------------------------------------------------
@@ -110,7 +122,7 @@ done
 ''' % (q(cfg.get("python") or "python3"), PYTHON_MIN[0] * 100 + PYTHON_MIN[1])
     rc, out = tg.capture(_script(probe, password), 60)
     found = next((l[6:].strip() for l in out.splitlines() if l.startswith("FOUND=")), "")
-    if not found:
+    if not found and not local:
         log(f"No Python >= {PYTHON_MIN[0]}.{PYTHON_MIN[1]} with venv support yet, trying to install one…")
         _sh(ctx, tg, 'case "$NZ_PM" in apt) as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3.12 python3.12-venv python3.12-dev || '
                      'as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3.11 python3.11-venv || true;;\n'
@@ -139,6 +151,11 @@ R={q(root)}
 as_root mkdir -p "$R/releases" "$R/shared/venvs" || exit 1
 as_root chown -R "$(id -un)":"$(id -gn)" "$R" || exit 1
 [ -w "$R/releases" ] && echo "deploy folder ready: $R" || exit 1
+'''
+    if local:
+        body = f'''R={q(root)}
+mkdir -p "$R/releases" "$R/shared/venvs" || exit 1
+[ -w "$R/releases" ] && [ -w "$R/shared/venvs" ] || exit 1
 '''
     if _sh(ctx, tg, body, password, cwd, 120, "prepare deploy folder") != 0:
         ctx.stage("folders", "failed")
