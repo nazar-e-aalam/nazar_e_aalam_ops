@@ -6,3 +6,4 @@ SQLAlchemy>=2.0.44,<2.1
 PyMySQL>=1.1
 cryptography>=42       # lets PyMySQL log in to MySQL 8+ (caching_sha2_password)
 Jinja2>=3.1            # email templates
+PyMySQL[rsa]>=1.1.1,<2
