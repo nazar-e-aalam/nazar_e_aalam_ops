@@ -25,7 +25,9 @@ set -euo pipefail
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOMAIN=""; EMAIL=""; ADMIN_EMAIL=""; ADMIN_PASSWORD=""; RUN_USER="nazar"; SUB="ops"; PANEL_PORT=8000; OPS_PORT=8100
 PANEL_CMD=""; SERVICE="nazar-panel"; DEPLOY_ROOT="/srv/nazar_e_aalam_panel"; INSTALL_DIR="/opt/nazar-ops"
-SSL=0; NO_NGINX=0; RENDER_ONLY=""; GENERATED_PW=0
+SSL=1; NO_NGINX=0; RENDER_ONLY=""; GENERATED_PW=0
+PUBLIC_IP=""; SKIP_DNS=0; DNS_TIMEOUT=1800
+SSL_READY=0
 
 . "$SRC/scripts/_lib.sh"
 need() { [ $# -ge 2 ] || die "option $1 needs a value"; }
@@ -46,6 +48,10 @@ while [ $# -gt 0 ]; do
     --install-dir) need "$@"; INSTALL_DIR="$2"; shift 2;;
     --render-only) need "$@"; RENDER_ONLY="$2"; shift 2;;
     --ssl) SSL=1; shift;;
+    --no-ssl) SSL=0; shift;;
+    --public-ip) need "$@"; PUBLIC_IP="$2"; shift 2;;
+    --skip-dns-check) SKIP_DNS=1; shift;;
+    --dns-timeout) need "$@"; DNS_TIMEOUT="$2"; shift 2;;
     --no-nginx) NO_NGINX=1; shift;;
     -h|--help) sed -n '2,26p' "$0"; exit 0;;
     *) die "unknown option: $1 (try --help)";;
@@ -54,10 +60,34 @@ done
 
 if [ -z "$DOMAIN" ] && [ -t 0 ]; then read -rp "Root domain (e.g. example.com): " DOMAIN; fi
 [ -n "$DOMAIN" ] || die "--domain is required"
-if [ -z "$RENDER_ONLY" ] && [ "$SSL" = 1 ] && [ -z "$EMAIL" ]; then
+if [ -z "$RENDER_ONLY" ] && [ "$NO_NGINX" != 1 ] && [ "$SSL" = 1 ] && [ -z "$EMAIL" ]; then
   if [ -t 0 ]; then read -rp "Email for the HTTPS certificate: " EMAIL; fi
   [ -n "$EMAIL" ] || die "--ssl needs --email"
 fi
+DOMAIN="${DOMAIN,,}"
+SUB="${SUB,,}"
+
+[[ "$DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] \
+    || die "invalid root domain"
+
+[[ "$DOMAIN" == *.* && "$DOMAIN" != *..* ]] \
+    || die "invalid root domain"
+
+[[ "$SUB" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] \
+    || die "invalid subdomain"
+
+[[ "$DNS_TIMEOUT" =~ ^[0-9]+$ ]] \
+    || die "invalid DNS timeout"
+
+for port in "$PANEL_PORT" "$OPS_PORT"; do
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] \
+        && (( 10#$port >= 1 && 10#$port <= 65535 )) \
+        || die "invalid port: $port"
+done
+
+[ "$PANEL_PORT" != "$OPS_PORT" ] \
+    || die "panel and ops ports must differ"
+
 ADMIN_EMAIL="${ADMIN_EMAIL:-${EMAIL:-admin@$DOMAIN}}"
 
 if [ -d /etc/nginx/sites-available ]; then NGINX_PATH=/etc/nginx/sites-available/nazar-ops; else NGINX_PATH=/etc/nginx/conf.d/nazar-ops.conf; fi
@@ -93,13 +123,120 @@ ok "using $($PY --version)"
 say "Installing system packages"
 if command -v apt-get >/dev/null; then
   export DEBIAN_FRONTEND=noninteractive
-  PKGS="python3-venv python3-pip git curl"
+  PKGS="python3-venv python3-pip git curl dnsutils ca-certificates openssl"
   [ "$NO_NGINX" = 1 ] || PKGS="$PKGS nginx"
   [ "$SSL" = 1 ] && PKGS="$PKGS certbot python3-certbot-nginx"
   apt-get update -qq && apt-get install -y -qq $PKGS >/dev/null
   ok "$PKGS"
 else
   echo "   (apt-get not found: make sure python3-venv, git$([ "$NO_NGINX" = 1 ] || echo ', nginx') are installed)"
+fi
+
+# ------------------------------------------------ DNS verification
+
+detect_public_ip() {
+    local ip
+
+    for endpoint in \
+        https://api.ipify.org \
+        https://checkip.amazonaws.com \
+        https://ipv4.icanhazip.com
+    do
+        ip="$(curl -4fsS --connect-timeout 5 --max-time 10 "$endpoint" 2>/dev/null || true)"
+
+        if python3 -c '
+import ipaddress, sys
+try:
+    ip = ipaddress.IPv4Address(sys.argv[1].strip())
+    sys.exit(0 if ip.is_global else 1)
+except ValueError:
+    sys.exit(1)
+' "$ip"; then
+            printf '%s\n' "$ip"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+dns_matches() {
+    local host="$1"
+    local resolver="$2"
+    local records
+
+    records="$(dig @"$resolver" "$host" A +short +time=3 +tries=1 \
+        | grep -E '^[0-9]+(\.[0-9]+){3}$' || true)"
+
+    [ -n "$records" ] || return 1
+
+    # Require all returned IPv4 records to match the server.
+    while IFS= read -r record; do
+        [ "$record" = "$PUBLIC_IP" ] || return 1
+    done <<< "$records"
+}
+
+verify_dns() {
+    local start elapsed host resolver ready
+
+    say "Checking public DNS"
+
+    if [ -z "$PUBLIC_IP" ]; then
+        PUBLIC_IP="$(detect_public_ip)" \
+            || die "cannot detect public IPv4; use --public-ip"
+    fi
+
+    python3 -c '
+import ipaddress, sys
+assert ipaddress.IPv4Address(sys.argv[1]).is_global
+' "$PUBLIC_IP" || die "invalid public IPv4"
+
+    ok "Server public IPv4: $PUBLIC_IP"
+
+    echo
+    echo "Required DNS records:"
+    printf '  %-8s %-35s %s\n' "TYPE" "NAME" "VALUE"
+    printf '  %-8s %-35s %s\n' "A" "$DOMAIN" "$PUBLIC_IP"
+    printf '  %-8s %-35s %s\n' "A" "$SUB.$DOMAIN" "$PUBLIC_IP"
+    echo
+    echo "Cloudflare: temporarily use DNS only (grey cloud)."
+    echo "Remove stale AAAA records if IPv6 is not configured."
+    echo "Waiting for DNS propagation..."
+    echo
+
+    start="$(date +%s)"
+
+    while true; do
+        ready=1
+
+        for host in "$DOMAIN" "$SUB.$DOMAIN"; do
+            for resolver in 1.1.1.1 8.8.8.8; do
+                if dns_matches "$host" "$resolver"; then
+                    ok "$host verified via $resolver"
+                else
+                    echo "  Waiting: $host via $resolver"
+                    ready=0
+                fi
+            done
+        done
+
+        [ "$ready" = 0 ] || break
+
+        elapsed=$(( $(date +%s) - start ))
+
+        if [ "$elapsed" -ge "$DNS_TIMEOUT" ]; then
+            die "DNS verification timed out. Correct DNS and re-run."
+        fi
+
+        echo "  Retrying in 15 seconds..."
+        sleep 15
+    done
+
+    ok "Both domains resolve to this server"
+}
+
+if [ "$NO_NGINX" != 1 ] && [ "$SKIP_DNS" != 1 ]; then
+    verify_dns
 fi
 
 say "Service user '$RUN_USER'"
@@ -127,10 +264,13 @@ else
   [ -n "$ADMIN_PASSWORD" ] || { ADMIN_PASSWORD="$(rand)"; GENERATED_PW=1; }     # shown once at the end (there is no password file)
   setv OPS_ADMIN_PASSWORD "$ADMIN_PASSWORD"
   # Secure cookies only work over HTTPS, so plain-http installs must turn them off until a certificate exists.
-  if [ "$SSL" = 1 ]; then setv OPS_HTTPS true; else setv OPS_HTTPS false; fi
+  setv OPS_HTTPS false
   chmod 600 "$ENVF"; chown "$RUN_USER": "$ENVF"
   ok "wrote $ENVF"
 fi
+env_set "$ENVF" OPS_ROOT_DOMAIN "$DOMAIN"
+env_set "$ENVF" OPS_SUBDOMAIN "$SUB"
+
 say "Database"
 setup_database "$ENVF" || die "database setup failed (see above)"
 chmod 600 "$ENVF"; chown "$RUN_USER": "$ENVF"
@@ -152,7 +292,8 @@ if [ "$NO_NGINX" != 1 ] && [ -d /etc/nginx/sites-enabled ]; then ln -sf "$NGINX_
 
 say "Starting services"
 systemctl daemon-reload
-systemctl enable --now nazar-ops >/dev/null 2>&1
+systemctl enable nazar-ops >/dev/null 2>&1
+systemctl restart nazar-ops
 systemctl enable "$SERVICE" >/dev/null 2>&1 || true     # starts at the first deployment, once code exists
 ok "nazar-ops running; $SERVICE enabled (starts after the first deployment)"
 if [ "$NO_NGINX" != 1 ]; then
@@ -160,8 +301,46 @@ if [ "$NO_NGINX" != 1 ]; then
   systemctl reload nginx; ok "nginx reloaded"
   if [ "$SSL" = 1 ]; then
     say "HTTPS certificate"
-    certbot --nginx -d "$DOMAIN" -d "$SUB.$DOMAIN" --non-interactive --agree-tos -m "$EMAIL" --redirect \
-      && ok "certificate installed" || echo "   certbot failed: check that DNS A records for $DOMAIN and $SUB.$DOMAIN point to this server, then re-run."
+    if certbot --nginx \
+        -d "$DOMAIN" \
+        -d "$SUB.$DOMAIN" \
+        --non-interactive \
+        --agree-tos \
+        --keep-until-expiring \
+        --redirect \
+        -m "$EMAIL"; then
+
+        nginx -t || die "SSL nginx configuration invalid"
+        systemctl reload nginx
+
+        for host in "$DOMAIN" "$SUB.$DOMAIN"; do
+            echo "  Checking TLS certificate for $host"
+
+            curl -sS \
+                --connect-timeout 10 \
+                --max-time 20 \
+                --resolve "$host:443:127.0.0.1" \
+                -o /dev/null \
+                "https://$host/" \
+                || die "TLS verification failed for $host"
+        done
+
+        SSL_READY=1
+        env_set "$ENVF" OPS_HTTPS true
+        systemctl restart nazar-ops
+
+        if systemctl list-unit-files certbot.timer \
+            --no-legend | grep -q certbot.timer; then
+            systemctl enable --now certbot.timer
+        fi
+
+        ok "HTTPS configured and verified"
+        ok "Certificate renewal configuration checked"
+    else
+        env_set "$ENVF" OPS_HTTPS false
+        systemctl restart nazar-ops
+        die "Certbot failed. Check DNS, firewall and nginx configuration."
+    fi
   fi
 fi
 
@@ -176,11 +355,12 @@ if [ -z "$HEALTH" ]; then
   die "fix the error above (often the database, see OPS_DB_* in $ENVF), then re-run this installer"
 fi
 ok "panel is healthy (database reachable)"
-SCHEME=http; [ "$SSL" = 1 ] && SCHEME=https
+SCHEME=http
+[ "$SSL_READY" = 0 ] || SCHEME=https
 echo
 echo "------------------------------------------------------------------"
 echo " Ops panel : $SCHEME://$SUB.$DOMAIN"
-echo " Public    : $SCHEME://$DOMAIN/applications"
+echo " Public    : $SCHEME://$SUB.$DOMAIN/apps"
 echo " Login     : $ADMIN_EMAIL"
 if [ "$GENERATED_PW" = 1 ]; then echo " Password  : $ADMIN_PASSWORD   <- shown once, change it in Settings > Account"
 else echo " Password  : (the one in $ENVF / the one you passed)"; fi
@@ -188,6 +368,9 @@ echo
 echo " Next: open the panel > Settings > GitHub, paste a token, then Servers > This server > Grant access."
 echo "       Granting sudo starts the automatic setup (packages, Python check, test build) and alerts you if it fails."
 echo "       Set up email under Settings > Email to get failure alerts in your inbox."
-[ "$SSL" = 1 ] || echo " Note: HTTPS is off. After DNS works run:  sudo certbot --nginx -d $DOMAIN -d $SUB.$DOMAIN"
-echo "       then set OPS_HTTPS=true in $ENVF and:  sudo systemctl restart nazar-ops"
+if [ "$SSL_READY" = 1 ]; then
+    echo " HTTPS     : enabled and verified"
+else
+    echo " HTTPS     : not configured by this installation"
+fi
 echo "------------------------------------------------------------------"
