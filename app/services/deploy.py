@@ -77,6 +77,9 @@ class Failure(Exception):
 def get_cfg() -> dict:
     cfg = dict(DEFAULTS)
     cfg.update(db.sget("deploy_cfg") or {})
+    if os.environ.get("OPS_MANAGED_DEPLOY_ROOT"):
+        cfg["deploy_root"] = os.environ["OPS_MANAGED_DEPLOY_ROOT"]
+        cfg["restart_cmd"] = "sudo systemctl restart " + os.environ.get("OPS_MANAGED_SERVICE", "nazar-panel")
     return cfg
 
 
@@ -96,6 +99,11 @@ def set_cfg(new: dict) -> dict:
         else:
             v = str(v).strip()
         cfg[k] = v
+    managed = os.environ.get("OPS_MANAGED_DEPLOY_ROOT")
+    if managed and cfg["deploy_root"] != managed:
+        raise ValueError("Change the local deployment root using scripts/install.sh --deploy-root")
+    if managed and cfg["restart_cmd"] != "sudo systemctl restart " + os.environ.get("OPS_MANAGED_SERVICE", "nazar-panel"):
+        raise ValueError("Change the managed service using scripts/install.sh --service")
     if not os.path.isabs(cfg["deploy_root"]) or cfg["deploy_root"].strip("/") == "":
         raise ValueError("Deploy root must be an absolute path such as /srv/nazar_e_aalam_panel")
     if not re.fullmatch(r"[\w./\-]+", cfg["branch"]):
@@ -541,8 +549,7 @@ def preflight(target_id: int = 0) -> dict:
             probs.append(_prob("access", f"{t['name']} has not passed the access check", "Run the check: SSH login, write access and sudo for the restart command.", href))
     else:
         chk = db.sget("local_checks") or {}
-        if time.time() - (chk.get("at") or 0) > 120:
-            chk = tgs.check(t, cfg)
+        chk = tgs.check(t, cfg)
         if not chk.get("ok"):
             bad = [c["label"] for c in chk.get("checks", []) if c["ok"] is False]
             probs.append(_prob("access", "This server is not ready to deploy", ", ".join(bad) or "Run the access check.", href))
@@ -575,6 +582,8 @@ def _restart_and_check(ctx: Ctx, cfg: dict, tg, root: str) -> None:
         ctx.stage("health", "running", cfg["health_url"])
         if not tg.health(ctx, cfg["health_url"], cfg["health_timeout"]):
             ctx.stage("health", "failed", "unhealthy")
+            from . import recovery
+            recovery.diagnose(ctx, cfg, tg)
             raise Failure("Health check failed after restart")
         ctx.stage("health", "success")
     else:
@@ -672,8 +681,16 @@ def _write_env(ctx: Ctx, cfg: dict, d: dict, rel: Path, t: dict) -> None:
     if rel.resolve() not in target.parents:
         raise Failure("Env target escapes the release directory")
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8")
-    target.chmod(0o600)
+    # Never expose secrets during creation, even with a permissive umask.
+    import tempfile
+    fd, tmp = tempfile.mkstemp(prefix=".nazar-env-", dir=target.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(content)
+        os.replace(tmp, target)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
     db.update(Deployment, Deployment.id == d["id"], env_version=cur["version"])
     n = len(envstore.parse(content)[0])
     ctx.log.write(f"Wrote {cfg['env_target']} (version {cur['version']}, {n} keys)")
@@ -688,16 +705,22 @@ def _prepare_venv(ctx: Ctx, cfg: dict, tg, root: str, rel: str, lrel: Path) -> s
         ctx.stage("venv", "failed")
         raise Failure(f"Python interpreter '{cfg['python']}' not found" + (" on the server" if tg.remote else ""))
     req = lrel / "requirements.txt"
-    blob = pyver.encode() + (req.read_bytes() if req.exists() else b"") + cfg["install_cmd"].encode()
+    blob = b"nazar-runtime-v2\0" + pyver.encode() + (req.read_bytes() if req.exists() else b"") + cfg["install_cmd"].encode()
     key = hashlib.sha256(blob).hexdigest()[:16]
     venv = f"{root}/shared/venvs/{key}"
     marker = f"{venv}/.nazar-ok"
     reuse = tg.capture(f"test -f {q(marker)}")[0] == 0
+    if reuse and tg.capture(f"{q(venv)}/bin/python -m pip check", 60)[0] != 0:
+        ctx.log.write("Cached environment failed validation; building a separate environment.")
+        venv += f"-repair-{ctx.id}"
+        marker = f"{venv}/.nazar-ok"
+        reuse = False
     if tg.run(ctx, f"test -x {q(venv)}/bin/python || (mkdir -p {q(root)}/shared/venvs && {q(cfg['python'])} -m venv {q(venv)})", rel, 600,
               show="create virtualenv") != 0:
         ctx.stage("venv", "failed")
         raise Failure("Could not create the virtualenv (is python3-venv installed?)")
-    tg.run(ctx, f"rm -rf {q(rel)}/.venv && ln -s {q(venv)} {q(rel)}/.venv", rel, 60, show="link virtualenv")
+    if tg.run(ctx, f"rm -rf {q(rel)}/.venv && ln -s {q(venv)} {q(rel)}/.venv", rel, 60, show="link virtualenv") != 0:
+        raise Failure("Could not link virtualenv")
     ctx.stage("venv", "success", "reused" if reuse else "created")
     if reuse:
         ctx.log.write("Dependencies unchanged, reusing the cached virtualenv.")
@@ -707,8 +730,14 @@ def _prepare_venv(ctx: Ctx, cfg: dict, tg, root: str, rel: str, lrel: Path) -> s
         if cfg["install_cmd"] and tg.run(ctx, cfg["install_cmd"], rel, cfg["command_timeout"], venv=venv) != 0:
             ctx.stage("install", "failed")
             raise Failure("Dependency install failed")
-        tg.capture(f"touch {q(marker)}")
+        # Known optional dependency and Python 3.14 compatibility checks.
+        from . import recovery
+        recovery.validate_runtime(ctx, tg, rel, venv)
+        if tg.capture(f"touch {q(marker)}")[0] != 0:
+            raise Failure("Could not mark validated virtualenv")
         ctx.stage("install", "success")
+    if tg.run(ctx, [f"{venv}/bin/python", "-m", "pip", "check"], rel, 120, show="validate dependencies") != 0:
+        raise Failure("Dependency validation failed")
     return venv
 
 
@@ -852,6 +881,9 @@ def execute(dep_id: int) -> None:
             ctx.log.write(f"Server set-up #{dep_id} -> {t['name']}")
             bootstrap.run(ctx, d, cfg, tg, t, pw)
         else:
+            if not tg.remote:
+                from . import recovery
+                recovery.prepare_local(ctx, cfg)
             tg.mkdirs(root)
             ctx.log.write(f"{'Rollback' if d['kind'] == 'rollback' else 'Deployment'} #{dep_id} "
                           f"{d['short_sha'] or ''} {d['message'] or ''} -> {t['name']}".strip())

@@ -123,7 +123,7 @@ ok "using $($PY --version)"
 say "Installing system packages"
 if command -v apt-get >/dev/null; then
   export DEBIAN_FRONTEND=noninteractive
-  PKGS="python3 python3-venv python3-pip git curl tar dnsutils ca-certificates openssl build-essential python3-dev libffi-dev libssl-dev"
+  PKGS="python3 python3-venv python3-pip git curl tar dnsutils ca-certificates openssl build-essential python3-dev libffi-dev libssl-dev acl"
   [ "$NO_NGINX" = 1 ] || PKGS="$PKGS nginx"
   [ "$SSL" = 1 ] && PKGS="$PKGS certbot python3-certbot-nginx"
   apt-get update -qq && apt-get install -y -qq $PKGS >/dev/null
@@ -243,6 +243,22 @@ say "Service user '$RUN_USER'"
 id "$RUN_USER" >/dev/null 2>&1 || useradd --system --create-home --shell /usr/sbin/nologin "$RUN_USER"
 ok "user ready"
 
+# Grant traversal only on home ancestors; never change home ownership.
+prepare_home_access() {
+  local path="$1" parent
+  case "$path" in /home/*/*)
+    parent="$(dirname "$path")"
+    while [ "$parent" != /home ]; do
+      [ -d "$parent" ] || mkdir -p "$parent"
+      if ! runuser -u "$RUN_USER" -- test -x "$parent"; then
+        setfacl -m "u:$RUN_USER:--x" "$parent"
+      fi
+      parent="$(dirname "$parent")"
+    done;;
+  esac
+}
+prepare_home_access "$INSTALL_DIR"
+prepare_home_access "$DEPLOY_ROOT"
 say "Installing the app into $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 if [ "$(readlink -f "$SRC")" != "$(readlink -f "$INSTALL_DIR")" ]; then
@@ -270,12 +286,17 @@ else
 fi
 env_set "$ENVF" OPS_ROOT_DOMAIN "$DOMAIN"
 env_set "$ENVF" OPS_SUBDOMAIN "$SUB"
+env_set "$ENVF" OPS_MANAGED_DEPLOY_ROOT "$DEPLOY_ROOT"
+env_set "$ENVF" OPS_MANAGED_SERVICE "$SERVICE"
 
 say "Database"
 setup_database "$ENVF" || die "database setup failed (see above)"
 chmod 600 "$ENVF"; chown "$RUN_USER": "$ENVF"
 mkdir -p "$DEPLOY_ROOT/releases" "$DEPLOY_ROOT/shared/venvs"
 chown "$RUN_USER": "$DEPLOY_ROOT" "$DEPLOY_ROOT/releases" "$DEPLOY_ROOT/shared" "$DEPLOY_ROOT/shared/venvs"
+
+runuser -u "$RUN_USER" -- test -w "$DEPLOY_ROOT/releases" || die "deployment directory not writable"
+runuser -u "$RUN_USER" -- test -w "$DEPLOY_ROOT/shared/venvs" || die "virtualenv directory not writable"
 
 say "Generating systemd, sudoers and nginx configuration"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
