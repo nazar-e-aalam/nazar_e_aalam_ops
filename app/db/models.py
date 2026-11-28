@@ -127,7 +127,7 @@ class Notification(Base):
     level: Mapped[str] = mapped_column(String(16), nullable=False, server_default="info")     # info | success | warning | error
     kind: Mapped[str] = mapped_column(String(64), nullable=False, server_default=_empty())    # deploy.failed, bootstrap.failed ...
     title: Mapped[str] = mapped_column(String(200), nullable=False)
-    body: Mapped[str] = mapped_column(Text, nullable=False, server_default=_empty())
+    body: Mapped[str] = mapped_column(Text, nullable=False, default="")
     link: Mapped[str] = mapped_column(String(255), nullable=False, server_default=_empty())
     emailed: Mapped[int] = mapped_column(Integer, nullable=False, server_default=_zero())
 
@@ -143,11 +143,11 @@ class Target(Base):
     port: Mapped[int] = mapped_column(Integer, nullable=False, server_default="22")
     user: Mapped[str | None] = mapped_column(String(64))
     root: Mapped[str] = mapped_column(String(512), nullable=False, server_default=_empty())
-    restart_cmd: Mapped[str] = mapped_column(Text, nullable=False, server_default=_empty())
+    restart_cmd: Mapped[str] = mapped_column(Text, nullable=False, default="")
     health_url: Mapped[str] = mapped_column(String(1024), nullable=False, server_default=_empty())
     key_mode: Mapped[str] = mapped_column(String(16), nullable=False, server_default="generated")
     python: Mapped[str] = mapped_column(String(64), nullable=False, server_default=_empty())      # interpreter picked by server set-up
-    checks: Mapped[str] = mapped_column(LongText, nullable=False, server_default=_empty())
+    checks: Mapped[str] = mapped_column(LongText, nullable=False, default="")
     verified: Mapped[int] = mapped_column(Integer, nullable=False, server_default=_zero())
     checked_at: Mapped[float | None] = mapped_column(Ts)
     created_at: Mapped[float | None] = mapped_column(Ts)
@@ -211,7 +211,7 @@ class App(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     slug: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
-    description: Mapped[str] = mapped_column(Text, nullable=False, server_default=_empty())
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
     created_at: Mapped[float] = mapped_column(Ts, nullable=False)
 
 
@@ -222,7 +222,7 @@ class Release(Base):
     version: Mapped[str] = mapped_column(String(64), nullable=False)
     platform: Mapped[str] = mapped_column(String(32), nullable=False)
     channel: Mapped[str] = mapped_column(String(32), nullable=False, server_default="stable")
-    notes: Mapped[str] = mapped_column(LongText, nullable=False, server_default=_empty())
+    notes: Mapped[str] = mapped_column(LongText, nullable=False, default="")
     visible: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
     status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="ready")
     error: Mapped[str | None] = mapped_column(Text)
