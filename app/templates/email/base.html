@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en" xmlns="http://www.w3.org/1999/xhtml">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="supported-color-schemes" content="light dark">
+<title>{{ subject }}</title>
+<style>
+  body,table,td,a{-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%}
+  table,td{mso-table-lspace:0;mso-table-rspace:0;border-collapse:collapse}
+  body{margin:0!important;padding:0!important;width:100%!important;background:#f3f5fa}
+  a{color:#1f6fe0}
+  .btn a{color:#1a1400!important;text-decoration:none}
+  @media (max-width:620px){
+    .wrap{width:100%!important}.pad{padding:24px 20px!important}.h1{font-size:22px!important}
+  }
+  @media (prefers-color-scheme:dark){
+    body,.bg{background:#06080c!important}
+    .card{background:#10131a!important;border-color:#232938!important}
+    .t{color:#eceff6!important}.m{color:#8a94a9!important}
+    .code{background:#0a0d13!important;border-color:#232938!important;color:#cfd5e4!important}
+    .box{background:#0a0d13!important;border-color:#232938!important}
+    a{color:#7db8ff!important}.btn a{color:#1a1400!important}
+  }
+</style>
+</head>
+<body class="bg" style="margin:0;padding:0;background:#f3f5fa;">
+<div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;mso-hide:all;">{{ preheader }}&#847;&zwnj;&nbsp;&#847;&zwnj;&nbsp;&#847;&zwnj;&nbsp;&#847;&zwnj;&nbsp;</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" class="bg" style="background:#f3f5fa;">
+<tr><td align="center" style="padding:32px 12px;">
+  <table role="presentation" width="560" cellpadding="0" cellspacing="0" class="wrap" style="width:560px;max-width:560px;">
+    <tr><td style="padding:0 4px 18px 4px;font-family:Manrope,'Segoe UI',Arial,sans-serif;">
+      <table role="presentation" cellpadding="0" cellspacing="0"><tr>
+        <td style="width:34px;height:34px;background:#ffd60a;border-radius:10px;text-align:center;font:800 17px/34px Arial,sans-serif;color:#1a1400;">N</td>
+        <td class="t" style="padding-left:10px;font:700 16px/1 Manrope,'Segoe UI',Arial,sans-serif;color:#131826;">{{ brand }}</td>
+      </tr></table>
+    </td></tr>
+    <tr><td class="card" style="background:#ffffff;border:1px solid #e3e7f0;border-radius:16px;overflow:hidden;">
+      <div style="height:4px;background:{{ accent }};line-height:4px;font-size:4px;">&nbsp;</div>
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td class="pad" style="padding:32px 36px 30px 36px;font-family:Manrope,'Segoe UI',Arial,sans-serif;">
+        {% if badge %}<div style="margin:0 0 14px 0;"><span style="display:inline-block;padding:4px 10px;border-radius:999px;background:{{ accent }};color:#1a1400;font:700 11px/1.4 Arial,sans-serif;letter-spacing:.06em;text-transform:uppercase;">{{ badge }}</span></div>{% endif %}
+        <h1 class="h1 t" style="margin:0 0 12px 0;font:800 26px/1.25 Manrope,'Segoe UI',Arial,sans-serif;color:#131826;">{{ title }}</h1>
+        {% block body %}{% endblock %}
+      </td></tr></table>
+    </td></tr>
+    <tr><td class="m" style="padding:20px 8px 0 8px;text-align:center;font:12px/1.6 Manrope,'Segoe UI',Arial,sans-serif;color:#667086;">
+      {% block footer %}{% endblock %}
+      Sent by {{ brand }} &middot; <a href="{{ panel_url }}" style="color:#667086;text-decoration:underline;">{{ panel_host }}</a><br>
+      You are receiving this because of your account on this panel.
+    </td></tr>
+  </table>
+</td></tr>
+</table>
+</body>
+</html>

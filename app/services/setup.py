@@ -7,7 +7,8 @@ import time
 import urllib.request
 from pathlib import Path
 
-from ..core import config, db
+from ..core import config
+from ..db import db
 
 _HOST = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 _LABEL = re.compile(r"^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$")

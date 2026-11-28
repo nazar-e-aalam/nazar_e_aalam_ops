@@ -16,12 +16,17 @@ from starlette.routing import Host, Mount, Route
 from starlette.staticfiles import StaticFiles
 from starlette.applications import Starlette
 
-from .core import config, db, security
+import logging
+
+from .core import config, logs, security
+from .db import db
+from .db.models import User
 from .services import deploy, library, setup
 from .routes.auth import router as auth_router
 from .routes.ops import router as ops_router
 from .routes.public import router as public_router
 
+logs.setup()
 WEB = Path(__file__).resolve().parents[1] / "web"
 
 OPS_CSP = ("default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
@@ -85,6 +90,12 @@ def ops_index():
     return HTMLResponse(html, headers={"Cache-Control": "no-cache", "X-Frame-Options": "DENY"})
 
 
+@ops.get("/healthz")
+def ops_health():
+    h = db.ping()
+    return JSONResponse({"ok": h["ok"], "db": h, "version": config.VERSION}, status_code=200 if h["ok"] else 503)
+
+
 @ops.get("/favicon.svg")
 def ops_icon():
     return FileResponse(WEB / "shared" / "favicon.svg", media_type="image/svg+xml")
@@ -99,6 +110,12 @@ public.mount("/applications/static/shared", NoCacheStatic(directory=WEB / "share
 public.mount("/applications/static/public", NoCacheStatic(directory=WEB / "public"), name="public-static")
 
 
+@public.get("/health")
+def public_health():
+    h = db.ping()
+    return JSONResponse({"ok": h["ok"]}, status_code=200 if h["ok"] else 503)
+
+
 @public.get("/favicon.svg")
 def public_icon():
     return FileResponse(WEB / "shared" / "favicon.svg", media_type="image/svg+xml")
@@ -106,9 +123,15 @@ def public_icon():
 
 # ---- wiring ---------------------------------------------------------------------
 def startup() -> None:
-    print(f"[ops] .env: {config.ENV_FILE or 'NOT FOUND (copy .env.example to .env in ' + str(config.BASE_DIR) + ')'}   database: {config.DB_PATH}")
-    db.init()
-    had_users = bool(db.one("SELECT id FROM users LIMIT 1"))
+    logs.setup()
+    log = logging.getLogger("ops.main")
+    log.info("Nazar Ops %s starting (.env: %s)", config.VERSION, config.ENV_FILE or "NOT FOUND, run scripts/setup.sh")
+    try:
+        db.init()
+    except db.DatabaseError as e:
+        raise SystemExit(f"\n[ops] DATABASE ERROR: {e}\n")
+    log.info("database ready: %s", db.redacted_url())
+    had_users = db.exists(User)
     security.seed_admin()
     if had_users and not setup.is_done():  # upgrading an existing install: nothing to set up again
         setup.mark_done("upgrade")
@@ -116,15 +139,15 @@ def startup() -> None:
     library.recover_imports()
     deploy.start()
     library.start_sync()
-    print(f"[ops] panel host: {config.PANEL_HOST}   public: {config.PUBLIC_URL}/applications   data: {config.DATA_DIR}")
-    if config.DEV:
-        print("[ops] DEV mode: panel also available at /ops/")
+    urls = [f"Panel   : {config.OPS_URL}", f"Public  : {config.PUBLIC_URL}/applications"]
+    logs.banner(["Nazar Ops is ready", *urls])
 
 
 @asynccontextmanager
 async def lifespan(_app):
     startup()
     yield
+    db.dispose()
 
 
 routes = [Host(config.PANEL_HOST, app=ops, name="ops-host")]

@@ -4,6 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Downloads</title>
+    <meta name="theme-color" content="#06080c" />
     <meta
       name="description"
       content="Download the latest apps and every previous version."
@@ -34,6 +35,10 @@
           ></a
         >
         <span class="sp"></span>
+        <a class="btn primary sm panel-link" href="{{PANEL_URL}}" rel="noopener">
+          <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>
+          <span class="long">Open panel</span><span class="short">Panel</span>
+        </a>
         <button
           class="btn ghost sm"
           id="tbtn"
@@ -45,8 +50,11 @@
       <div class="skel" style="height: 220px; border-radius: 20px"></div>
     </main>
     <footer class="wrapw pfoot">
-      Downloads are delivered through a fast GitHub mirror. Where a SHA-256 is
-      shown, use it to verify your file.
+      <span>
+        Downloads are delivered through a fast GitHub mirror. Where a SHA-256 is
+        shown, use it to verify your file.
+      </span>
+      <a class="foot-link" href="{{PANEL_URL}}" rel="noopener">Ops panel &rarr;</a>
     </footer>
     <script src="/applications/static/public/public.js?v={{V}}"></script>
   </body>

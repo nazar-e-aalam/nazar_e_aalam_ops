@@ -1,0 +1,8 @@
+{% extends "base.html" %}{% import "_macros.html" as m %}
+{% block body %}
+{{ m.p(summary) }}
+{% if facts %}{{ m.facts(facts) }}{% endif %}
+{% if log %}<div class="m" style="margin:18px 0 0 0;font:600 12px/1 Manrope,Arial,sans-serif;color:#667086;text-transform:uppercase;letter-spacing:.04em;">Last lines of the log</div>{{ m.logbox(log) }}{% endif %}
+{% if hint %}{{ m.small(hint) }}{% endif %}
+{% if link %}{{ m.button(button or "Open in panel", link) }}{% endif %}
+{% endblock %}

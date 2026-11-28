@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parents[2]
-VERSION = "1.0.0"
+VERSION = "1.3.0"
 
 
 def _load_env_file(path: Path) -> None:
@@ -49,17 +49,30 @@ PUBLIC_URL = _get("OPS_PUBLIC_URL", f"{_scheme}://{ROOT_DOMAIN}").rstrip("/")
 # Base address used in emailed links. Only ever taken from the server's own config, never from request headers.
 OPS_URL = _get("OPS_URL", "http://localhost:8100/ops" if DEV and ROOT_DOMAIN == "localhost" else f"{_scheme}://{PANEL_HOST}").rstrip("/")
 
+# Uploaded builds, staged files and SSH keys live here. There are NO log files: everything is printed to the terminal.
 DATA_DIR = Path(_get("OPS_DATA_DIR", str(BASE_DIR / "data"))).resolve()
-DB_PATH = DATA_DIR / "ops.db"
-LOG_DIR = DATA_DIR / "logs"
 APPS_DIR = DATA_DIR / "apps"
 TMP_DIR = DATA_DIR / "tmp"
-for _d in (DATA_DIR, LOG_DIR, APPS_DIR, TMP_DIR):
+for _d in (DATA_DIR, APPS_DIR, TMP_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 try:
     DATA_DIR.chmod(0o700)
 except OSError:
     pass
+
+# --- database (MySQL / MariaDB) ---------------------------------------------------------------------------------
+# scripts/setup.sh installs MySQL/MariaDB, creates the database + user and writes these values into .env for you.
+# The database itself is also created on start if the user is allowed to (CREATE DATABASE IF NOT EXISTS).
+DB_HOST = _get("OPS_DB_HOST", "127.0.0.1")
+DB_PORT = int(_get("OPS_DB_PORT", "3306") or 3306)
+DB_NAME = _get("OPS_DB_NAME", "nazar_ops")
+DB_USER = _get("OPS_DB_USER", "nazar_ops")
+DB_PASSWORD = os.environ.get("OPS_DB_PASSWORD", "")          # not stripped: spaces may be intentional
+DB_SOCKET = _get("OPS_DB_SOCKET")                            # optional unix socket, used instead of host/port when set
+DB_POOL_SIZE = int(_get("OPS_DB_POOL_SIZE", "10") or 10)
+DB_POOL_RECYCLE = int(_get("OPS_DB_POOL_RECYCLE", "1800") or 1800)
+DB_ECHO = _bool("OPS_DB_ECHO", False)
+LOG_LEVEL = _get("OPS_LOG_LEVEL", "INFO").upper()
 
 ADMIN_EMAIL = _get("OPS_ADMIN_EMAIL", "admin@example.com").lower()
 ADMIN_PASSWORD = _get("OPS_ADMIN_PASSWORD")

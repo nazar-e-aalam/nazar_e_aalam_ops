@@ -4,7 +4,8 @@ import hashlib
 import re
 import time
 
-from . import db
+from ..db import db
+from ..db.models import EnvVersion
 
 MAX_BYTES = 256 * 1024
 _LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_.\-]*)\s*=\s*(.*)$")
@@ -69,11 +70,11 @@ def mask(value: str) -> str:
 
 
 def current():
-    return db.one("SELECT * FROM env_versions ORDER BY version DESC LIMIT 1")
+    return db.get(EnvVersion, order=EnvVersion.version.desc())
 
 
 def get(version: int):
-    return db.one("SELECT * FROM env_versions WHERE version=?", (version,))
+    return db.get(EnvVersion, EnvVersion.version == version)
 
 
 def save(content: str, user: str, note: str = ""):
@@ -91,8 +92,8 @@ def save(content: str, user: str, note: str = ""):
     if cur and cur["sha"] == sha:
         raise ValueError("No changes: identical to the current version.")
     version = (cur["version"] if cur else 0) + 1
-    db.execute("INSERT INTO env_versions(version,content,sha,note,created_by,created_at,key_count) VALUES(?,?,?,?,?,?,?)",
-               (version, content, sha, note[:200], user, time.time(), len(variables)))
+    db.insert(EnvVersion, version=version, content=content, sha=sha, note=note[:200], created_by=user,
+              created_at=time.time(), key_count=len(variables))
     return {"version": version, "keys": len(variables), "warnings": problems}
 
 
@@ -110,5 +111,6 @@ def diff(a: dict, b: dict) -> dict:
 
 
 def versions(limit: int = 50):
-    return db.query("SELECT version,sha,note,created_by,created_at,key_count FROM env_versions ORDER BY version DESC LIMIT ?",
-                    (limit,))
+    return db.all(EnvVersion, order=EnvVersion.version.desc(), limit=limit,
+                  cols=[EnvVersion.version, EnvVersion.sha, EnvVersion.note, EnvVersion.created_by,
+                        EnvVersion.created_at, EnvVersion.key_count])

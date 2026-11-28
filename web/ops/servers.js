@@ -1,4 +1,4 @@
-/* Servers: deploy to this server or to other servers over SSH keys, with a guided setup (connection, key, sudo check, database). */
+/* Servers: deploy to this server or to other servers over SSH keys, with a guided setup (connection, key, access check, automatic server setup). */
 (function () {
   "use strict";
   var O = window.OPS, h = O.h, icon = O.icon, api = O.api, toast = O.toast, fail = O.fail, busy = O.busy, can = O.can, chip = O.chip, F = O.fmt;
@@ -7,7 +7,11 @@
   function code(text, label) { return h("div", { class: "wz-code" }, h("code", null, text), h("button", { class: "btn ghost sm", type: "button", onclick: function () { O.copy(text, label || "Copied"); } }, icon("copy"), "Copy")); }
   function note(kind, title, body) { return h("div", { class: "wz-note " + kind }, title ? h("b", null, title) : null, h("div", null, body)); }
   function field(label, input, hint) { return h("div", { class: "field" }, h("label", null, label), input, hint ? h("div", { class: "hint" }, hint) : null); }
-  function dbLabel(t) { var d = t.db; return d.mode === "external" ? "External " + ({ mysql: "MySQL", mariadb: "MariaDB", postgres: "PostgreSQL" }[d.engine] || d.engine) + " · " + d.host : "Local database"; }
+  function setupLabel(t) {
+    var b = t.bootstrap;
+    if (!b) return "Not set up yet" + (t.verified ? "" : " (runs after sudo access is granted)");
+    return "Set up " + F.ago(b.at) + (b.python ? " · Python " + String(b.version || b.python).replace(/^Python /, "") : "") + (b.tested ? " · tests passed" : "");
+  }
   function checkRow(c) {
     var cls = c.ok === true ? "ok" : c.ok === false ? "bad" : "warn";
     return h("div", { class: "check-row " + cls }, h("span", { class: "ic" }, icon(c.ok === true ? "check" : "alert")),
@@ -36,7 +40,7 @@
         h("div", { class: "row wrap", style: { gap: "10px" } }, h("span", { class: "srv-ic" }, icon("server")), h("div", { style: { flex: 1, minWidth: 0 } }, h("h3", { style: { margin: 0 } }, t.name),
           h("div", { class: "sub mono" }, t.kind === "local" ? "this machine (where the ops panel runs)" : t.user + "@" + t.host + ":" + t.port + (t.root ? "  ·  " + t.root : ""))), status,
           d.auto_target === t.id ? chip("info", "Auto deploy target") : null),
-        h("div", { class: "row wrap sub", style: { gap: "14px", margin: "10px 0" } }, h("span", null, icon("box"), " ", dbLabel(t)),
+        h("div", { class: "row wrap sub", style: { gap: "14px", margin: "10px 0" } }, h("span", null, icon("box"), " ", setupLabel(t)),
           ck ? h("span", null, good + "/" + n + " checks passed · " + F.ago(ck.at)) : h("span", null, "never checked"), t.fingerprint ? h("span", { class: "mono", title: "Host key fingerprint" }, t.fingerprint.slice(0, 22) + "…") : null),
         h("div", { class: "row wrap" }, h("a", { class: "btn primary", href: "#/servers/" + t.id }, icon("gear"), t.verified ? "Open" : "Set up guide"),
           can("operator") ? h("button", { class: "btn", type: "button", onclick: function (e) { busy(e.target.closest("button"), api("POST", "/api/targets/" + t.id + "/check").then(function (r) { toast(r.result.ok ? "All checks passed" : "Some checks need attention", r.result.ok ? "ok" : "err"); load(); }).catch(fail)); } }, icon("refresh"), "Check access") : null,
@@ -54,7 +58,7 @@
     page.append(h("a", { class: "btn ghost sm", href: "#/servers", style: { alignSelf: "flex-start" } }, icon("back"), "All servers"),
       h("div", { class: "wz-hero" }, h("span", { class: "srv-ic big" }, icon("server")), h("div", null, h("h2", { id: "srvTitle" }, isNew ? "Add a server" : "Server guide"), h("p", { class: "sub" }, "A short guide: it explains every value. Nothing is changed on the server until you press a button."))), bar, body);
     var local = false;
-    function names() { return local ? ["Access check", "Database", "Done"] : ["Connection", "SSH key", "Access check", "Database", "Done"]; }
+    function names() { return local ? ["Access check", "Server setup", "Done"] : ["Connection", "SSH key", "Access check", "Server setup", "Done"]; }
     function paint() {
       bar.replaceChildren.apply(bar, names().map(function (n, i) { return h("li", { class: i === step ? "on" : i < step ? "done" : "", onclick: function () { if (T || i === 0) go(i); } }, h("span", { class: "n" }, i < step ? icon("check") : String(i + 1)), h("span", { class: "l" }, n)); }));
     }
@@ -65,7 +69,7 @@
         next === false ? null : h("button", { class: "btn primary", type: "button", onclick: function (e) { fn ? fn(e) : go(step + 1); } }, label || "Continue"));
     }
     function reload(then) { return api("GET", "/api/targets/" + T.id).then(function (t) { T = t; then && then(); render(); paint(); }); }
-    function render() { var s = names()[step]; ({ "Connection": sConn, "SSH key": sKey, "Access check": sCheck, "Database": sDb, "Done": sDone })[s](); }
+    function render() { var s = names()[step]; ({ "Connection": sConn, "SSH key": sKey, "Access check": sCheck, "Server setup": sSetup, "Done": sDone })[s](); }
 
     /* step: connection */
     function sConn() {
@@ -119,7 +123,7 @@
         if (sudoBad) {
           var pw = h("input", { type: "password", placeholder: "sudo password of " + (T.user || "that user"), autocomplete: "off" });
           kids.push(h("div", { class: "wz-opt" }, h("h4", null, "Grant access to restart the service"), h("p", { class: "sub" }, "Type the user's sudo password once. The panel installs a rule that lets this one command run without a password and then forgets the password (it is not stored or logged)."),
-            h("div", { class: "row wrap" }, pw, h("button", { class: "btn primary", type: "button", onclick: function (e) { busy(e.target.closest("button"), api("POST", "/api/targets/" + T.id + "/grant-sudo", { password: pw.value }).then(function (x) { pw.value = ""; T = x.target; toast("Access granted", "ok"); paint2(x.result); }).catch(fail)); } }, icon("key"), "Grant access")),
+            h("div", { class: "row wrap" }, pw, h("button", { class: "btn primary", type: "button", onclick: function (e) { busy(e.target.closest("button"), api("POST", "/api/targets/" + T.id + "/grant-sudo", { password: pw.value }).then(function (x) { pw.value = ""; T = x.target; toast("Access granted", "ok"); paint2(x.result); if (x.bootstrap_id) { toast("Setting up the server now…", "ok"); O.go("deploy/" + x.bootstrap_id); } }).catch(fail)); } }, icon("key"), "Grant access")),
             h("details", { class: "wz-file" }, h("summary", null, "Prefer to do it yourself? Run this on the server"), code("echo '" + r.sudoers + "' | sudo tee /etc/sudoers.d/zz-nazar-ops-" + (T.user || "deploy") + " && sudo chmod 440 /etc/sudoers.d/zz-nazar-ops-" + (T.user || "deploy") + " && sudo visudo -c", "Command copied"))));
         }
         kids.unshift(r.ok ? note("info", "Ready for deployments", "Everything required passed " + F.ago(r.at) + ".") : note("warn", "Not ready yet", "Fix the red items, then run the check again."));
@@ -131,36 +135,17 @@
       paint2(res);
     }
 
-    /* step: database */
-    function sDb() {
-      var d = T.db, mode = d.mode, tabs = h("div", { class: "ptabs" }), fieldsBox = h("div", { class: "col" }), res = h("div", { class: "col" });
-      var eng = h("select", null, [["mysql", "MySQL"], ["mariadb", "MariaDB"], ["postgres", "PostgreSQL"]].map(function (o) { return h("option", { value: o[0], selected: d.engine === o[0] }, o[1]); })),
-        host = h("input", { type: "text", value: d.host, placeholder: "db.example.com or 10.0.0.5", spellcheck: false }), port = h("input", { type: "number", value: d.port }),
-        name = h("input", { type: "text", value: d.name, placeholder: "my_database" }), user = h("input", { type: "text", value: d.user, placeholder: "app_user", autocomplete: "off" }),
-        pw = h("input", { type: "password", value: "", placeholder: d.has_password ? "saved, leave empty to keep" : "database password", autocomplete: "new-password" }), ssl = h("input", { type: "checkbox" }), keys = {};
-      ssl.checked = !!d.ssl; eng.onchange = function () { if (+port.value === 3306 || +port.value === 5432) port.value = eng.value === "postgres" ? 5432 : 3306; };
-      ["host", "port", "name", "user", "password", "url"].forEach(function (k) { keys[k] = h("input", { type: "text", value: d.keys[k], spellcheck: false, style: { fontFamily: "var(--mono)" } }); });
-      function body2() { return { mode: mode, engine: eng.value, host: host.value, port: +port.value, name: name.value, user: user.value, password: pw.value, ssl: ssl.checked, keys: { host: keys.host.value, port: keys.port.value, name: keys.name.value, user: keys.user.value, password: keys.password.value, url: keys.url.value } }; }
-      function drawFields() {
-        if (mode === "local") { fieldsBox.replaceChildren(note("info", "Local database", "Your app uses the database installed on " + T.name + ". The panel adds nothing to its .env, so keep your own DB_* values in the Environment tab.")); res.replaceChildren(); return; }
-        fieldsBox.replaceChildren(h("div", { class: "grid g3" }, field("Database type", eng), field("Host", host, "Server name or IP of the database."), field("Port", port, "3306 MySQL/MariaDB, 5432 PostgreSQL.")),
-          h("div", { class: "grid g3" }, field("Database name", name), field("User", user), field("Password", pw)),
-          h("label", { class: "wz-check" }, ssl, h("span", null, h("b", null, "Require an encrypted (SSL/TLS) connection"), h("small", null, "Turn on for managed databases (PlanetScale, RDS, DigitalOcean…) that demand it."))),
-          note("info", "How it reaches your app", "At every deployment these values are written into the .env of " + T.name + ", replacing the same keys. Nothing else in your Environment is changed. The deployment is blocked while any of them is empty."),
-          h("details", { class: "wz-file" }, h("summary", null, "Env key names (change only if your app uses other names)"), h("div", { class: "grid g3", style: { marginTop: "8px" } }, ["host", "port", "name", "user", "password", "url"].map(function (k) { return field(k === "url" ? "Connection URL (empty = skip)" : k, keys[k]); }))),
-          h("div", { class: "row" }, can("operator") ? h("button", { class: "btn", type: "button", onclick: function (e) {
-            busy(e.target.closest("button"), api("POST", "/api/targets/" + T.id + "/db/test", body2()).then(function (r) {
-              var rows = [checkRow({ ok: r.panel.ok, label: "Reachable from the ops panel", detail: r.panel.ok ? r.panel.ms + " ms" : r.panel.error })];
-              if (r.auth) rows.push(checkRow({ ok: r.auth.ok, label: "Login and protocol", detail: r.auth.detail, fix: r.auth.fix }));
-              rows.push(checkRow({ ok: r.from_target.ok, label: "Reachable from " + r.from_target.where, detail: r.from_target.ok ? "the server can open the connection" : r.from_target.error, fix: r.from_target.ok ? "" : "Allow that server's IP in the database firewall / allowed hosts list." }));
-              res.replaceChildren.apply(res, rows);
-            }).catch(fail));
-          } }, icon("refresh"), "Test connection") : null), res);
-      }
-      ["Local (on the server)", "External database"].forEach(function (l, i) { var m = i ? "external" : "local", b = h("button", { type: "button", class: mode === m ? "on" : "", onclick: function () { mode = m; tabs.querySelectorAll("button").forEach(function (x) { x.classList.remove("on"); }); b.classList.add("on"); drawFields(); } }, l); tabs.appendChild(b); });
-      body.replaceChildren(h("h3", null, "4. Database"), h("p", { class: "sub" }, "Where does the app on this server keep its data? Use an external MySQL (or MariaDB / PostgreSQL) such as a managed cloud database, or keep the local one."), tabs, fieldsBox,
-        nav(true, "Save & continue", function (e) { busy(e.target.closest("button"), api("PUT", "/api/targets/" + T.id + "/db", body2()).then(function (t) { T = t; toast("Database settings saved", "ok"); go(step + 1); }).catch(fail)); }));
-      drawFields();
+    /* step: server setup (runs by itself after sudo access is granted) */
+    function sSetup() {
+      var st = T.bootstrap, pw = h("input", { type: "password", placeholder: "sudo password (only if needed)", autocomplete: "off" });
+      body.replaceChildren(h("h3", null, local ? "2. Server setup" : "4. Server setup"),
+        h("p", { class: "sub" }, "After sudo access is granted the panel prepares the machine by itself: installs Python, venv, pip, git, curl and build tools, checks the Python version, creates the deploy folder, then clones your repository, installs its dependencies and runs your test command once. If anything fails you get a notification (and an email when email is set up)."),
+        st ? note(st.tested ? "info" : "warn", st.tested ? "Set up and tested" : "Set up", "Finished " + F.ago(st.at) + (st.python ? ". Python: " + st.python + " (" + String(st.version || "") + ")" : "") + (st.tested ? ". The test build passed." : ". The test build was skipped (add a GitHub token in Settings, then run it again).")) : note("info", "Not run yet", "Press the button below, or grant sudo access in the access check step and it starts by itself."),
+        can("admin") ? h("div", { class: "row wrap" }, pw, h("button", { class: "btn primary", type: "button", onclick: function (e) {
+          busy(e.target.closest("button"), api("POST", "/api/targets/" + T.id + "/bootstrap", { password: pw.value }).then(function (r) { pw.value = ""; O.go("deploy/" + r.id); }).catch(fail));
+        } }, icon("rocket"), st ? "Run setup again" : "Set up this server")) : null,
+        h("div", { class: "hint" }, "The sudo password is used once, kept in memory only and never stored or written to the log. Leave it empty if the user is root or already has passwordless sudo."),
+        nav(true, "Continue", null, "Skip"));
     }
 
     /* step: done */
@@ -170,7 +155,7 @@
       api("GET", "/api/deploy/preflight?target=" + T.id).then(function (p) {
         box.replaceChildren(p.ok ? note("info", "Ready to deploy", T.name + " passed every requirement. Open Deployments, choose it in the server list and press Deploy.") : note("warn", "Not ready yet", "Fix these first:"),
           p.problems.map(function (x) { return h("div", { class: "check-row bad" }, h("span", { class: "ic" }, icon("alert")), h("div", null, h("b", null, x.title), x.detail ? h("div", { class: "sub" }, x.detail) : null, x.href ? h("a", { href: x.href, class: "btn sm", style: { marginTop: "6px" } }, "Fix it") : null)); }),
-          h("div", { class: "wz-sum" }, [["Server", T.name], ["Address", local ? "this machine" : T.user + "@" + T.host + ":" + T.port], ["Database", dbLabel(T)], ["Access", T.verified ? "verified " + (T.checked_at ? F.ago(T.checked_at) : "") : "not verified"]].map(function (r) { return h("div", null, h("span", { class: "k" }, r[0]), h("code", { class: "inline" }, r[1])); })),
+          h("div", { class: "wz-sum" }, [["Server", T.name], ["Address", local ? "this machine" : T.user + "@" + T.host + ":" + T.port], ["Server setup", setupLabel(T)], ["Access", T.verified ? "verified " + (T.checked_at ? F.ago(T.checked_at) : "") : "not verified"]].map(function (r) { return h("div", null, h("span", { class: "k" }, r[0]), h("code", { class: "inline" }, r[1])); })),
           h("div", { class: "row" }, h("a", { class: "btn primary", href: "#/deploy" }, icon("rocket"), "Go to Deployments"), h("a", { class: "btn", href: "#/servers" }, "All servers")));
       }).catch(function (e) { box.replaceChildren(O.empty("alert", "Could not check", e.message)); });
     }

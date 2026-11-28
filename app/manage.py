@@ -10,11 +10,13 @@ import secrets
 import sys
 import time
 
-from .core import db, security
+from .core import security
+from .db import db
+from .db.models import RecoveryCode, User, UserSession
 
 
 def _user(email: str):
-    u = db.one("SELECT * FROM users WHERE email=?", (email.strip().lower(),))
+    u = db.get(User, User.email == email.strip().lower())
     if not u:
         sys.exit(f"No user with email {email}")
     return u
@@ -38,7 +40,7 @@ def main(argv: list) -> int:
     db.init()
     cmd = argv[0] if argv else ""
     if cmd == "list-users":
-        for u in db.query("SELECT email,role,disabled,totp_enabled FROM users ORDER BY id"):
+        for u in db.all(User, order=User.id, cols=[User.email, User.role, User.disabled, User.totp_enabled]):
             print(f"{u['email']:40} {u['role']:9} {'disabled ' if u['disabled'] else ''}{'2FA' if u['totp_enabled'] else ''}")
         return 0
     if len(argv) != 2 or cmd not in ("reset-password", "disable-2fa", "create-admin"):
@@ -48,22 +50,22 @@ def main(argv: list) -> int:
     if cmd == "reset-password":
         u = _user(email)
         pw = _ask_password()
-        db.execute("UPDATE users SET password_hash=?, disabled=0 WHERE id=?", (security.hash_password(pw), u["id"]))
-        db.execute("DELETE FROM sessions WHERE user_id=?", (u["id"],))
+        db.update(User, User.id == u["id"], password_hash=security.hash_password(pw), disabled=0)
+        db.delete(UserSession, UserSession.user_id == u["id"])
         db.audit("cli", "password.reset", email)
         print(f"Password for {email} updated; they were signed out everywhere.")
     elif cmd == "disable-2fa":
         u = _user(email)
-        db.execute("UPDATE users SET totp_secret=NULL,totp_pending=NULL,totp_enabled=0,totp_last_step=0 WHERE id=?", (u["id"],))
-        db.execute("DELETE FROM recovery_codes WHERE user_id=?", (u["id"],))
+        db.update(User, User.id == u["id"], totp_secret=None, totp_pending=None, totp_enabled=0, totp_last_step=0)
+        db.delete(RecoveryCode, RecoveryCode.user_id == u["id"])
         db.audit("cli", "2fa.reset_by_admin", email)
         print(f"Two-factor authentication turned off for {email}.")
     else:
-        if db.one("SELECT id FROM users WHERE email=?", (email,)):
+        if db.exists(User, User.email == email):
             sys.exit("That user already exists. Use reset-password.")
         pw = _ask_password()
-        db.execute("INSERT INTO users(email,name,first_name,password_hash,role,created_at) VALUES(?,?,?,?,?,?)",
-                   (email, email.split("@")[0], email.split("@")[0], security.hash_password(pw), "admin", time.time()))
+        db.insert(User, email=email, name=email.split("@")[0], first_name=email.split("@")[0],
+                  password_hash=security.hash_password(pw), role="admin", created_at=time.time())
         db.audit("cli", "user.created", f"{email} (admin)")
         print(f"Admin {email} created.")
     return 0

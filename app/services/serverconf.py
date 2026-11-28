@@ -17,12 +17,14 @@ _HOST = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$")
 
 OPS_UNIT = """[Unit]
 Description=Nazar Ops panel (releases, deployments, public downloads)
-After=network.target
+After=network.target mysql.service mariadb.service
+Wants=mariadb.service
 
 [Service]
 User={{USER}}
 Group={{USER}}
 WorkingDirectory={{OPS_DIR}}
+Environment=PYTHONUNBUFFERED=1
 ExecStart={{OPS_DIR}}/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port {{OPS_PORT}} --proxy-headers --forwarded-allow-ips=127.0.0.1
 Restart=always
 RestartSec=3

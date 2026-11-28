@@ -2,12 +2,19 @@
 import base64
 import hashlib
 import hmac
+import logging
 import os
 import secrets
 import threading
 import time
 
-from . import config, db
+from sqlalchemy import select
+
+from . import config, logs
+from ..db import db
+from ..db.models import User, UserSession
+
+log = logging.getLogger("ops.auth")
 
 COOKIE = "ops_session"
 _SCRYPT = dict(n=2 ** 14, r=8, p=1)
@@ -40,32 +47,29 @@ def check_password_strength(password: str) -> str | None:
 
 def seed_admin() -> None:
     """Create the first admin from OPS_ADMIN_EMAIL / OPS_ADMIN_PASSWORD."""
-    if db.one("SELECT id FROM users LIMIT 1"):
+    if db.get(User, cols=[User.id]):
         # database already has users: make sure the admin from .env can still get in
         if config.ADMIN_PASSWORD:
-            u = db.one("SELECT id FROM users WHERE email=?", (config.ADMIN_EMAIL,))
+            u = db.get(User, User.email == config.ADMIN_EMAIL, cols=[User.id])
             if not u:
-                db.execute("INSERT INTO users(email,name,password_hash,role,created_at) VALUES(?,?,?,?,?)",
-                           (config.ADMIN_EMAIL, config.ADMIN_NAME, hash_password(config.ADMIN_PASSWORD), "admin", time.time()))
-                print(f"[ops] Added admin {config.ADMIN_EMAIL} from .env (the database already had other users)")
+                db.insert(User, email=config.ADMIN_EMAIL, name=config.ADMIN_NAME,
+                          password_hash=hash_password(config.ADMIN_PASSWORD), role="admin", created_at=time.time())
+                log.info("added admin %s from .env (the database already had other users)", config.ADMIN_EMAIL)
             elif config.ADMIN_FORCE:
-                db.execute("UPDATE users SET password_hash=?, role='admin' WHERE id=?", (hash_password(config.ADMIN_PASSWORD), u["id"]))
-                print(f"[ops] Password of {config.ADMIN_EMAIL} reset from .env (OPS_ADMIN_FORCE_PASSWORD is on, turn it off after login)")
+                db.update(User, User.id == u["id"], password_hash=hash_password(config.ADMIN_PASSWORD), role="admin")
+                log.warning("password of %s reset from .env (OPS_ADMIN_FORCE_PASSWORD is on, turn it off after login)", config.ADMIN_EMAIL)
         return
     password = config.ADMIN_PASSWORD
     generated = False
     if not password:
         password = secrets.token_urlsafe(14)
         generated = True
-    db.execute("INSERT INTO users(email,name,password_hash,role,created_at) VALUES(?,?,?,?,?)",
-               (config.ADMIN_EMAIL, config.ADMIN_NAME, hash_password(password), "admin", time.time()))
+    db.insert(User, email=config.ADMIN_EMAIL, name=config.ADMIN_NAME, password_hash=hash_password(password),
+              role="admin", created_at=time.time())
     if generated:
-        f = config.DATA_DIR / "initial_admin_password.txt"
-        f.write_text(f"{config.ADMIN_EMAIL}\n{password}\n")
-        f.chmod(0o600)
-        print(f"[ops] Seeded admin {config.ADMIN_EMAIL}. Generated password saved to {f}")
+        logs.banner(["First login (shown once, change it in Settings > Account)", f"Email    : {config.ADMIN_EMAIL}", f"Password : {password}"])
     else:
-        print(f"[ops] Seeded admin {config.ADMIN_EMAIL}")
+        log.info("seeded admin %s", config.ADMIN_EMAIL)
 
 
 # ---- sessions ----------------------------------------------------------------
@@ -84,9 +88,9 @@ def new_token() -> str:
 def create_session(user_id: int, ip: str, ua: str) -> str:
     token = secrets.token_urlsafe(32)
     now = time.time()
-    db.execute("INSERT INTO sessions(token_hash,user_id,created_at,expires_at,last_seen,ip,ua) VALUES(?,?,?,?,?,?,?)",
-               (_th(token), user_id, now, now + config.SESSION_HOURS * 3600, now, ip, (ua or "")[:300]))
-    db.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
+    db.insert(UserSession, token_hash=_th(token), user_id=user_id, created_at=now,
+              expires_at=now + config.SESSION_HOURS * 3600, last_seen=now, ip=ip, ua=(ua or "")[:300])
+    db.delete(UserSession, UserSession.expires_at < now)
     return token
 
 
@@ -94,19 +98,22 @@ def user_for_token(token: str | None):
     if not token:
         return None
     now = time.time()
-    row = db.one("""SELECT u.id,u.email,u.name,u.first_name,u.last_name,u.totp_enabled,u.role,u.disabled,s.expires_at,s.last_seen,s.token_hash
-                    FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=?""", (_th(token),))
+    row = db.select_one(
+        select(User.id, User.email, User.name, User.first_name, User.last_name, User.totp_enabled, User.role, User.disabled,
+               UserSession.expires_at, UserSession.last_seen, UserSession.token_hash)
+        .select_from(UserSession.__table__.join(User.__table__, User.id == UserSession.user_id))
+        .where(UserSession.token_hash == _th(token)))
     if not row or row["expires_at"] < now or row["disabled"]:
         return None
     if now - row["last_seen"] > 60:
-        db.execute("UPDATE sessions SET last_seen=? WHERE token_hash=?", (now, row["token_hash"]))
+        db.update(UserSession, UserSession.token_hash == row["token_hash"], last_seen=now)
     row["session"] = row["token_hash"][:12]
     return row
 
 
 def destroy_session(token: str | None) -> None:
     if token:
-        db.execute("DELETE FROM sessions WHERE token_hash=?", (_th(token),))
+        db.delete(UserSession, UserSession.token_hash == _th(token))
 
 
 # ---- login throttling (in memory, per ip+email) -------------------------------

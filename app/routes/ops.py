@@ -15,8 +15,13 @@ import re
 import shutil
 import threading
 
-from ..core import config, db, envstore, mailer, security, totp
-from ..services import deploy, library, serverconf, setup, targets as tgs, workflows
+from sqlalchemy import func, or_, select
+
+from ..core import config, envstore, mailer, security, totp
+from ..db import db
+from ..db.models import (App, Asset, Audit, Deployment, LoginChallenge, RecoveryCode, Release, TrackedRun, User,
+                         UserSession)
+from ..services import bootstrap, deploy, library, notify, serverconf, setup, targets as tgs, workflows
 from ..services import github as gh
 
 router = APIRouter()
@@ -47,8 +52,14 @@ def current_user(request: Request) -> dict:
     return user
 
 
-def security_cfg() -> dict:
-    return {"require_2fa": bool((db.sget("security_cfg") or {}).get("require_2fa"))}
+_SEC_CACHE: list = [0.0, None]       # [fetched_at, value]; one worker process, so a short cache is safe
+
+
+def security_cfg(fresh: bool = False) -> dict:
+    now = time.time()
+    if fresh or _SEC_CACHE[1] is None or now - _SEC_CACHE[0] > 5:
+        _SEC_CACHE[:] = [now, {"require_2fa": bool((db.sget("security_cfg") or {}).get("require_2fa"))}]
+    return dict(_SEC_CACHE[1])
 
 
 def must_setup_2fa(user: dict) -> bool:
@@ -66,7 +77,7 @@ def csrf(request: Request) -> None:
 
 def start_session(user_id: int, request: Request, response: Response) -> None:
     token = security.create_session(user_id, ip_of(request), request.headers.get("user-agent", ""))
-    db.execute("UPDATE users SET last_login=? WHERE id=?", (time.time(), user_id))
+    db.update(User, User.id == user_id, last_login=time.time())
     response.set_cookie(security.COOKIE, token, max_age=config.SESSION_HOURS * 3600, httponly=True,
                         samesite="lax", secure=config.HTTPS, path="/")
 
@@ -125,7 +136,7 @@ def login(body: LoginBody, request: Request, response: Response):
     wait = security.throttled(key)
     if wait:
         raise HTTPException(429, f"Too many attempts. Try again in {wait // 60 + 1} min.")
-    u = db.one("SELECT * FROM users WHERE email=?", (email,))
+    u = db.get(User, User.email == email)
     ok = security.verify_password(body.password, u["password_hash"] if u else _DUMMY_HASH)
     if not u or not ok or u["disabled"]:
         security.note_failure(key)
@@ -134,9 +145,8 @@ def login(body: LoginBody, request: Request, response: Response):
     security.clear_failures(key)
     if u["totp_enabled"]:
         challenge = security.new_token()
-        db.execute("DELETE FROM login_challenges WHERE expires_at<?", (time.time(),))
-        db.execute("INSERT INTO login_challenges(token_hash,user_id,expires_at) VALUES(?,?,?)",
-                   (security.token_hash(challenge), u["id"], time.time() + 300))
+        db.delete(LoginChallenge, LoginChallenge.expires_at < time.time())
+        db.insert(LoginChallenge, token_hash=security.token_hash(challenge), user_id=u["id"], expires_at=time.time() + 300)
         return {"need_2fa": True, "challenge": challenge}
     start_session(u["id"], request, response)
     db.audit(email, "login", "", ip_of(request))
@@ -156,26 +166,26 @@ def login_2fa(body: TwoFABody, request: Request, response: Response):
     wait = security.throttled(key)
     if wait:
         raise HTTPException(429, f"Too many attempts. Try again in {wait // 60 + 1} min.")
-    ch = db.one("SELECT * FROM login_challenges WHERE token_hash=?", (th,))
+    ch = db.get(LoginChallenge, LoginChallenge.token_hash == th)
     if not ch or ch["expires_at"] < time.time():
         raise HTTPException(401, "This sign-in expired. Enter your password again.")
-    u = db.one("SELECT * FROM users WHERE id=?", (ch["user_id"],))
+    u = db.get(User, User.id == ch["user_id"])
     if not u or u["disabled"] or not u["totp_enabled"]:
         raise HTTPException(401, "This sign-in expired. Enter your password again.")
     if not accept_second_factor(u, body.code):
         security.note_failure(key)
-        db.execute("UPDATE login_challenges SET attempts=attempts+1 WHERE token_hash=?", (th,))
+        db.update(LoginChallenge, LoginChallenge.token_hash == th, attempts=LoginChallenge.attempts + 1)
         if ch["attempts"] + 1 >= 5:
-            db.execute("DELETE FROM login_challenges WHERE token_hash=?", (th,))
+            db.delete(LoginChallenge, LoginChallenge.token_hash == th)
             db.audit(u["email"], "login.2fa_locked", "", ip_of(request))
             raise HTTPException(401, "Too many wrong codes. Enter your password again.")
         db.audit(u["email"], "login.2fa_failed", "", ip_of(request))
         raise HTTPException(401, "That code is not right")
     security.clear_failures(key)
-    db.execute("DELETE FROM login_challenges WHERE token_hash=?", (th,))
+    db.delete(LoginChallenge, LoginChallenge.token_hash == th)
     start_session(u["id"], request, response)
     db.audit(u["email"], "login", "2fa", ip_of(request))
-    return {"user": user_view(db.one("SELECT * FROM users WHERE id=?", (u["id"],)))}
+    return {"user": user_view(db.get(User, User.id == u["id"]))}
 
 
 def accept_second_factor(u: dict, code: str, allow_recovery: bool = True) -> bool:
@@ -183,10 +193,10 @@ def accept_second_factor(u: dict, code: str, allow_recovery: bool = True) -> boo
     code = (code or "").strip()
     step = totp.verify(u["totp_secret"] or "", code, u["totp_last_step"])
     if step is not None:
-        return db.rowcount("UPDATE users SET totp_last_step=? WHERE id=? AND totp_last_step<?", (step, u["id"], step)) == 1
+        return db.update(User, User.id == u["id"], User.totp_last_step < step, totp_last_step=step) == 1
     if allow_recovery and totp.norm_recovery(code):
-        return db.rowcount("UPDATE recovery_codes SET used_at=? WHERE user_id=? AND code_hash=? AND used_at IS NULL",
-                           (time.time(), u["id"], totp.hash_recovery(code))) == 1
+        return db.update(RecoveryCode, RecoveryCode.user_id == u["id"], RecoveryCode.code_hash == totp.hash_recovery(code),
+                         RecoveryCode.used_at.is_(None), used_at=time.time()) == 1
     return False
 
 
@@ -215,9 +225,9 @@ def update_profile(body: ProfileBody, request: Request, user: dict = Depends(cur
     first, last = body.first_name.strip()[:40], body.last_name.strip()[:40]
     if not first:
         raise HTTPException(400, "First name is required")
-    db.execute("UPDATE users SET first_name=?, last_name=?, name=? WHERE id=?", (first, last, f"{first} {last}".strip(), user["id"]))
+    db.update(User, User.id == user["id"], first_name=first, last_name=last, name=f"{first} {last}".strip())
     db.audit(user["email"], "profile.updated", "", ip_of(request))
-    return {"user": user_view(db.one("SELECT * FROM users WHERE id=?", (user["id"],)))}
+    return {"user": user_view(db.get(User, User.id == user["id"]))}
 
 
 class PasswordBody(BaseModel):
@@ -227,16 +237,16 @@ class PasswordBody(BaseModel):
 
 @router.post("/api/me/password")
 def change_password(body: PasswordBody, request: Request, user: dict = Depends(current_user)):
-    row = db.one("SELECT password_hash FROM users WHERE id=?", (user["id"],))
+    row = db.get(User, User.id == user["id"], cols=[User.password_hash])
     if not security.verify_password(body.current, row["password_hash"]):
         raise HTTPException(400, "Current password is wrong")
     err = security.check_password_strength(body.new)
     if err:
         raise HTTPException(400, err)
-    db.execute("UPDATE users SET password_hash=? WHERE id=?", (security.hash_password(body.new), user["id"]))
+    db.update(User, User.id == user["id"], password_hash=security.hash_password(body.new))
     me_tok = request.cookies.get(security.COOKIE)
     keep = hashlib.sha256(me_tok.encode()).hexdigest() if me_tok else ""
-    db.execute("DELETE FROM sessions WHERE user_id=? AND token_hash!=?", (user["id"], keep))
+    db.delete(UserSession, UserSession.user_id == user["id"], UserSession.token_hash != keep)
     db.audit(user["email"], "password.changed", "", ip_of(request))
     return {"ok": True}
 
@@ -245,31 +255,35 @@ def change_password(body: PasswordBody, request: Request, user: dict = Depends(c
 def my_sessions(request: Request, user: dict = Depends(current_user)):
     tok = request.cookies.get(security.COOKIE) or ""
     mine = hashlib.sha256(tok.encode()).hexdigest()
-    rows = db.query("SELECT token_hash,created_at,last_seen,ip,ua FROM sessions WHERE user_id=? ORDER BY last_seen DESC", (user["id"],))
+    rows = db.all(UserSession, UserSession.user_id == user["id"], order=UserSession.last_seen.desc(),
+                  cols=[UserSession.token_hash, UserSession.created_at, UserSession.last_seen, UserSession.ip, UserSession.ua])
     return [{"id": r["token_hash"][:12], "created_at": r["created_at"], "last_seen": r["last_seen"], "ip": r["ip"],
              "ua": r["ua"], "current": r["token_hash"] == mine} for r in rows]
 
 
 @router.delete("/api/me/sessions/{sid}")
 def revoke_session(sid: str, user: dict = Depends(current_user)):
-    db.execute("DELETE FROM sessions WHERE user_id=? AND substr(token_hash,1,12)=?", (user["id"], sid))
+    if len(sid) == 12:      # token hashes are 64 chars, so only a 12-char id can equal their first 12
+        db.delete(UserSession, UserSession.user_id == user["id"], UserSession.token_hash.startswith(sid, autoescape=True))
     return {"ok": True}
 
 
 # ---- overview --------------------------------------------------------------------
 @router.get("/api/overview")
 def overview(user: dict = Depends(current_user)):
-    out = {"online": db.query("""SELECT u.email,u.name,u.role,MAX(s.last_seen) AS last_seen FROM sessions s JOIN users u ON u.id=s.user_id
-                                  WHERE s.last_seen>? AND s.expires_at>? GROUP BY u.id ORDER BY last_seen DESC""",
-                              (time.time() - 300, time.time())),
+    out = {"online": db.select_rows(
+        select(User.email, User.name, User.role, func.max(UserSession.last_seen).label("last_seen"))
+        .select_from(UserSession.__table__.join(User.__table__, User.id == UserSession.user_id))
+        .where(UserSession.last_seen > time.time() - 300, UserSession.expires_at > time.time())
+        .group_by(User.id, User.email, User.name, User.role).order_by(func.max(UserSession.last_seen).desc())),
            "token": {"set": bool(gh.token()), "rate": gh.rate},
            "server": deploy.server_status(),
-           "last_deploys": [deploy.shape(d) for d in db.query("SELECT * FROM deployments ORDER BY id DESC LIMIT 5")],
-           "activity": db.query("SELECT ts,user_email,action,detail FROM audit ORDER BY id DESC LIMIT 12"),
+           "last_deploys": [deploy.shape(d) for d in db.all(Deployment, order=Deployment.id.desc(), limit=5)],
+           "activity": db.all(Audit, order=Audit.id.desc(), limit=12, cols=[Audit.ts, Audit.user_email, Audit.action, Audit.detail]),
            "library": library.public_apps(), "runs": [], "runs_error": None, "running": 0}
     try:
         data = gh.jget(gh.repo_path("app") + "/actions/runs", params={"per_page": 8}, ttl=8)
-        tracked = {r["run_id"]: r for r in db.query("SELECT * FROM tracked_runs WHERE repo='app' ORDER BY run_id DESC LIMIT 200")}
+        tracked = {r["run_id"]: r for r in db.all(TrackedRun, TrackedRun.repo == "app", order=TrackedRun.run_id.desc(), limit=200)}
         out["runs"] = [workflows.shape_run(r, tracked.get(r["id"])) for r in data.get("workflow_runs", [])]
         out["running"] = sum(1 for r in out["runs"] if r["status"] in ("running", "queued"))
     except gh.GitHubError as e:
@@ -370,14 +384,14 @@ def dispatch(key: str, wid: int, body: DispatchBody, request: Request, user: dic
             runs = gh.jget(f"{rp}/actions/workflows/{wid}/runs", params={"event": "workflow_dispatch", "per_page": 10}, use_cache=False)
         except gh.GitHubError:
             continue
-        taken = {r["run_id"] for r in db.query("SELECT run_id FROM tracked_runs WHERE repo=?", (key,))}
+        taken = {r["run_id"] for r in db.all(TrackedRun, TrackedRun.repo == key, cols=[TrackedRun.run_id])}
         cands = [r for r in runs.get("workflow_runs", [])
                  if r["id"] not in taken and (gh.iso_to_epoch(r["created_at"]) or 0) >= t0 - 3]
         if cands:
             run_id = min(cands, key=lambda r: r["id"])["id"]
     if run_id:
-        db.execute("INSERT OR IGNORE INTO tracked_runs(repo,run_id,workflow,ref,inputs,triggered_by,triggered_at) VALUES(?,?,?,?,?,?,?)",
-                   (key, run_id, wf["name"], ref, repr(inputs), user["email"], time.time()))
+        db.insert_ignore(TrackedRun, repo=key, run_id=run_id, workflow=wf["name"], ref=ref, inputs=repr(inputs),
+                         triggered_by=user["email"], triggered_at=time.time())
     db.audit(user["email"], "workflow.run", f"{wf['name']} @ {ref} {inputs} -> run {run_id or '?'}", ip_of(request))
     return {"run_id": run_id, "message": None if run_id else "Dispatched. The run has not shown up yet, check the Runs page."}
 
@@ -391,7 +405,7 @@ def list_runs(key: str, workflow: int = 0, status: str = "", page: int = 1, user
         params["status"] = status
     path = f"{rp}/actions/workflows/{workflow}/runs" if workflow else f"{rp}/actions/runs"
     data = gh_call(gh.jget, path, params=params, ttl=4)
-    tracked = {r["run_id"]: r for r in db.query("SELECT * FROM tracked_runs WHERE repo=? ORDER BY run_id DESC LIMIT 500", (key,))}
+    tracked = {r["run_id"]: r for r in db.all(TrackedRun, TrackedRun.repo == key, order=TrackedRun.run_id.desc(), limit=500)}
     return {"total": data.get("total_count", 0), "page": page,
             "runs": [workflows.shape_run(r, tracked.get(r["id"])) for r in data.get("workflow_runs", [])]}
 
@@ -402,7 +416,7 @@ def run_detail(key: str, run_id: int, user: dict = Depends(current_user)):
     run = gh_call(gh.jget, f"{rp}/actions/runs/{run_id}", ttl=2.5)
     jobs = gh_call(gh.jget, f"{rp}/actions/runs/{run_id}/jobs", params={"per_page": 100, "filter": "latest"}, ttl=2.5)["jobs"]
     wf = workflows.get_definition(key, run.get("path", "").split("@")[0], run["head_sha"])
-    tracked = db.one("SELECT * FROM tracked_runs WHERE repo=? AND run_id=?", (key, run_id))
+    tracked = db.get(TrackedRun, TrackedRun.repo == key, TrackedRun.run_id == run_id)
     arts = []
     try:
         arts = gh.jget(f"{rp}/actions/runs/{run_id}/artifacts", params={"per_page": 50}, ttl=5).get("artifacts", [])
@@ -478,9 +492,9 @@ def deploy_status(target: int = 0, user: dict = Depends(current_user)):
 @router.get("/api/deploy/list")
 def deploy_list(limit: int = 30, offset: int = 0, target: int = -1, user: dict = Depends(current_user)):
     if target >= 0:
-        rows = db.query("SELECT * FROM deployments WHERE target_id=? ORDER BY id DESC LIMIT ? OFFSET ?", (target, min(limit, 100), offset))
+        rows = db.all(Deployment, Deployment.target_id == target, order=Deployment.id.desc(), limit=max(1, min(limit, 100)), offset=max(0, offset))
     else:
-        rows = db.query("SELECT * FROM deployments ORDER BY id DESC LIMIT ? OFFSET ?", (min(limit, 100), offset))
+        rows = db.all(Deployment, order=Deployment.id.desc(), limit=max(1, min(limit, 100)), offset=max(0, offset))
     return {"deployments": [deploy.shape(r) for r in rows], "releases": deploy.releases_on_disk(max(target, 0))}
 
 
@@ -493,7 +507,7 @@ def deploy_preflight(target: int = 0, user: dict = Depends(current_user)):
 def deploy_head(ref: str = "", user: dict = Depends(current_user)):
     cfg = deploy.get_cfg()
     c = gh_call(deploy.resolve_commit, ref or cfg["branch"])
-    c["deployed"] = bool(db.one("SELECT id FROM deployments WHERE sha=? AND kind='deploy' AND status='success'", (c["sha"],)))
+    c["deployed"] = db.exists(Deployment, Deployment.sha == c["sha"], Deployment.kind == "deploy", Deployment.status == "success")
     return c
 
 
@@ -516,7 +530,7 @@ def deploy_now(body: DeployBody, request: Request, user: dict = Depends(operator
 
 @router.get("/api/deploy/{dep_id}")
 def deploy_get(dep_id: int, user: dict = Depends(current_user)):
-    d = db.one("SELECT * FROM deployments WHERE id=?", (dep_id,))
+    d = db.get(Deployment, Deployment.id == dep_id)
     if not d:
         raise HTTPException(404, "Deployment not found")
     return deploy.shape(d)
@@ -525,7 +539,7 @@ def deploy_get(dep_id: int, user: dict = Depends(current_user)):
 @router.get("/api/deploy/{dep_id}/log")
 def deploy_log(dep_id: int, offset: int = 0, user: dict = Depends(current_user)):
     text, nxt = deploy.read_log(dep_id, max(0, offset))
-    d = db.one("SELECT status FROM deployments WHERE id=?", (dep_id,))
+    d = db.get(Deployment, Deployment.id == dep_id, cols=[Deployment.status])
     return {"text": text, "next": nxt, "status": d["status"] if d else "unknown"}
 
 
@@ -556,7 +570,8 @@ def deploy_rollback(body: RollbackBody, request: Request, user: dict = Depends(o
         raise HTTPException(404, "That release is not on the server anymore")
     if name == tg.active(root):
         raise HTTPException(400, "That release is already active")
-    src = db.one("SELECT sha,short_sha,message,author,branch FROM deployments WHERE release_name=? AND target_id=? ORDER BY id DESC LIMIT 1", (name, t["id"])) or {}
+    src = db.get(Deployment, Deployment.release_name == name, Deployment.target_id == t["id"], order=Deployment.id.desc(),
+                 cols=[Deployment.sha, Deployment.short_sha, Deployment.message, Deployment.author, Deployment.branch]) or {}
     commit = {"sha": src.get("sha"), "message": f"Roll back to {name}", "author": src.get("author", ""), "branch": src.get("branch", "")}
     dep_id = deploy.enqueue(commit, user["email"], "rollback", kind="rollback", release=name, target_id=t["id"])
     db.audit(user["email"], "deploy.rollback", f"{name} on {t['name']}", ip_of(request))
@@ -594,7 +609,7 @@ async def github_hook(request: Request):
     if not secret:
         raise HTTPException(503, "Webhook secret not configured")
     expected = "sha256=" + hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(sig, expected):
+    if not hmac.compare_digest(sig.encode("utf-8", "replace"), expected.encode()):
         raise HTTPException(401, "Bad signature")
     event = request.headers.get("x-github-event", "")
     if event == "ping":
@@ -602,7 +617,11 @@ async def github_hook(request: Request):
     if event != "push":
         return Response(status_code=202)
     import json
-    code, msg = deploy.handle_push(json.loads(raw.decode("utf-8")))
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        raise HTTPException(400, "Body is not valid JSON")
+    code, msg = deploy.handle_push(payload)
     return Response(content=json.dumps({"message": msg}), status_code=code, media_type="application/json")
 
 
@@ -692,7 +711,7 @@ def env_download(request: Request, user: dict = Depends(admin_only)):
 # ---- release library -----------------------------------------------------------------------
 @router.get("/api/library")
 def library_list(user: dict = Depends(current_user)):
-    return {"apps": db.query("SELECT * FROM apps ORDER BY name"), "releases": library.list_releases(public=False),
+    return {"apps": db.all(App, order=App.name), "releases": library.list_releases(public=False),
             "public_url": config.PUBLIC_URL}
 
 
@@ -726,7 +745,7 @@ class SyncBody(BaseModel):
 
 def _sync_state() -> dict:
     return {"cfg": library.sync_cfg(), "status": db.sget("sync_status"), "busy": library.sync_busy(),
-            "forgotten": len(library._skip_set()), "importing": db.one("SELECT COUNT(*) AS n FROM releases WHERE status='importing'")["n"]}
+            "forgotten": len(library._skip_set()), "importing": db.count(Release, Release.status == "importing")}
 
 
 @router.get("/api/library/sync")
@@ -773,7 +792,7 @@ def _proxy_url_ok(u: str) -> str:
 
 
 def _proxy_sample():
-    a = db.one("SELECT direct_url FROM assets WHERE direct_url IS NOT NULL ORDER BY id DESC LIMIT 1")
+    a = db.get(Asset, Asset.direct_url.isnot(None), order=Asset.id.desc(), cols=[Asset.direct_url])
     return a["direct_url"] if a else None
 
 
@@ -861,15 +880,17 @@ class ReleasePatch(BaseModel):
 
 @router.patch("/api/library/releases/{rid}")
 def library_patch(rid: int, body: ReleasePatch, request: Request, user: dict = Depends(operator_only)):
-    r = db.one("SELECT id FROM releases WHERE id=?", (rid,))
+    r = db.get(Release, Release.id == rid, cols=[Release.id])
     if not r:
         raise HTTPException(404, "Release not found")
+    vals = {}
     if body.visible is not None:
-        db.execute("UPDATE releases SET visible=? WHERE id=?", (1 if body.visible else 0, rid))
+        vals["visible"] = 1 if body.visible else 0
     if body.notes is not None:
-        db.execute("UPDATE releases SET notes=? WHERE id=?", (body.notes[:20000], rid))
+        vals["notes"] = body.notes[:20000]
     if body.channel in ("stable", "beta"):
-        db.execute("UPDATE releases SET channel=? WHERE id=?", (body.channel, rid))
+        vals["channel"] = body.channel
+    db.update(Release, Release.id == rid, **vals)
     db.audit(user["email"], "library.edit", f"release {rid} {body.model_dump(exclude_none=True)}", ip_of(request))
     return {"ok": True}
 
@@ -899,18 +920,6 @@ class KeyBody(BaseModel):
 
 class SudoBody(BaseModel):
     password: str = ""
-
-
-class DbBody(BaseModel):
-    mode: str = "local"
-    engine: str = "mysql"
-    host: str = ""
-    port: int = 3306
-    name: str = ""
-    user: str = ""
-    password: str = ""
-    ssl: bool = False
-    keys: dict = {}
 
 
 def _target(tid: int) -> dict:
@@ -990,7 +999,25 @@ def targets_grant(tid: int, body: SudoBody, request: Request, user: dict = Depen
     _terr(tgs.grant_sudo, t, deploy.eff_cfg(deploy.get_cfg(), t), body.password)
     db.audit(user["email"], "server.sudo", t["name"], ip_of(request))
     res = tgs.check(t, deploy.eff_cfg(deploy.get_cfg(), t))
-    return {"result": res, "target": tgs.shape(_target(tid))}
+    # sudo works now: set the machine up automatically (packages, Python, folders, test build). The password stays in memory only.
+    setup_id = None
+    try:
+        setup_id = bootstrap.start(t, user["email"], body.password)
+    except ValueError:
+        pass
+    return {"result": res, "target": tgs.shape(_target(tid)), "bootstrap_id": setup_id}
+
+
+@router.post("/api/targets/{tid}/bootstrap")
+def targets_bootstrap(tid: int, body: SudoBody, request: Request, user: dict = Depends(admin_only)):
+    """Run the server set-up again (root / passwordless sudo need no password)."""
+    t = _target(tid)
+    try:
+        dep_id = bootstrap.start(t, user["email"], body.password)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    db.audit(user["email"], "server.setup", t["name"], ip_of(request))
+    return {"id": dep_id}
 
 
 @router.post("/api/targets/{tid}/forget-host")
@@ -1000,24 +1027,59 @@ def targets_forget(tid: int, user: dict = Depends(admin_only)):
     return tgs.shape(_target(tid))
 
 
-@router.put("/api/targets/{tid}/db")
-def targets_db_save(tid: int, body: DbBody, request: Request, user: dict = Depends(admin_only)):
-    _target(tid)
-    _terr(tgs.save_db, tid, body.model_dump())
-    db.audit(user["email"], "server.db", f"{_target(tid)['name']} mode={body.mode}", ip_of(request))
-    return tgs.shape(_target(tid))
-
-
-@router.post("/api/targets/{tid}/db/test")
-def targets_db_test(tid: int, body: DbBody, user: dict = Depends(operator_only)):
-    return _terr(tgs.db_test, _target(tid), body.model_dump())
-
-
 @router.put("/api/targets/auto/{tid}")
 def targets_auto(tid: int, user: dict = Depends(admin_only)):
     _target(tid)
     deploy.set_cfg({"auto_target": tid})
     return {"auto_target": tid}
+
+
+# ---- notifications, email, database ----------------------------------------------------------------------
+@router.get("/api/notifications")
+def notifications(user: dict = Depends(current_user)):
+    return notify.feed(user["id"])
+
+
+@router.post("/api/notifications/seen")
+def notifications_seen(user: dict = Depends(current_user)):
+    notify.mark_seen(user["id"])
+    return {"ok": True}
+
+
+@router.get("/api/notifications/config")
+def notify_cfg_get(user: dict = Depends(admin_only)):
+    return {**notify.get_cfg(), "mail_ready": mailer.configured(), "recipients": notify.recipients()}
+
+
+class NotifyCfgBody(BaseModel):
+    email: bool = True
+    on_success: bool = False
+    extra_emails: str = ""
+
+
+@router.put("/api/notifications/config")
+def notify_cfg_put(body: NotifyCfgBody, request: Request, user: dict = Depends(admin_only)):
+    try:
+        cfg = notify.set_cfg(body.model_dump())
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    db.audit(user["email"], "notify.config", "", ip_of(request))
+    return {**cfg, "mail_ready": mailer.configured(), "recipients": notify.recipients()}
+
+
+@router.get("/api/email/preview/{kind}")
+def email_preview(kind: str, user: dict = Depends(admin_only)):
+    try:
+        return Response(mailer.preview(kind), media_type="text/html; charset=utf-8",
+                        headers={"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; img-src data:",
+                                 "X-Frame-Options": "SAMEORIGIN"})
+    except KeyError:
+        raise HTTPException(404, "Unknown template")
+
+
+@router.get("/api/system/database")
+def system_database(user: dict = Depends(admin_only)):
+    return db.info()
 
 
 # ---- first-run setup wizard ---------------------------------------------------------------------
@@ -1105,7 +1167,8 @@ def server_configs(domain: str = "", sub: str = "", panel_cmd: str = "", panel_p
 # ---- users + audit ----------------------------------------------------------------------------
 @router.get("/api/users")
 def users_list(user: dict = Depends(admin_only)):
-    return db.query("SELECT id,email,name,first_name,last_name,role,disabled,totp_enabled,created_at,last_login FROM users ORDER BY id")
+    return db.all(User, order=User.id, cols=[User.id, User.email, User.name, User.first_name, User.last_name, User.role, User.disabled,
+                                      User.totp_enabled, User.created_at, User.last_login])
 
 
 class NewUser(BaseModel):
@@ -1125,10 +1188,10 @@ def users_create(body: NewUser, request: Request, user: dict = Depends(admin_onl
     err = security.check_password_strength(body.password)
     if err:
         raise HTTPException(400, err)
-    if db.one("SELECT id FROM users WHERE email=?", (email,)):
+    if db.exists(User, User.email == email):
         raise HTTPException(400, "A user with this email already exists")
-    db.execute("INSERT INTO users(email,name,password_hash,role,created_at) VALUES(?,?,?,?,?)",
-               (email, body.name.strip()[:60] or email.split("@")[0], security.hash_password(body.password), body.role, time.time()))
+    db.insert(User, email=email, name=body.name.strip()[:60] or email.split("@")[0],
+              password_hash=security.hash_password(body.password), role=body.role, created_at=time.time())
     db.audit(user["email"], "user.created", f"{email} ({body.role})", ip_of(request))
     return {"ok": True}
 
@@ -1141,27 +1204,32 @@ class UserPatch(BaseModel):
 
 @router.patch("/api/users/{uid}")
 def users_patch(uid: int, body: UserPatch, request: Request, user: dict = Depends(admin_only)):
-    target = db.one("SELECT * FROM users WHERE id=?", (uid,))
+    target = db.get(User, User.id == uid)
     if not target:
         raise HTTPException(404, "User not found")
-    admins = db.one("SELECT COUNT(*) AS n FROM users WHERE role='admin' AND disabled=0")["n"]
-    losing_admin = target["role"] == "admin" and ((body.role and body.role != "admin") or body.disabled)
+    admins = db.count(User, User.role == "admin", User.disabled == 0)
+    losing_admin = target["role"] == "admin" and not target["disabled"] and ((body.role and body.role != "admin") or body.disabled)
     if losing_admin and admins <= 1:
         raise HTTPException(400, "You cannot remove the last active admin")
-    if body.role:
-        if body.role not in ("admin", "operator", "viewer"):
-            raise HTTPException(400, "Invalid role")
-        db.execute("UPDATE users SET role=? WHERE id=?", (body.role, uid))
-    if body.disabled is not None:
-        db.execute("UPDATE users SET disabled=? WHERE id=?", (1 if body.disabled else 0, uid))
-        if body.disabled:
-            db.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
+    if body.role and body.role not in ("admin", "operator", "viewer"):
+        raise HTTPException(400, "Invalid role")
     if body.password:
         err = security.check_password_strength(body.password)
         if err:
             raise HTTPException(400, err)
-        db.execute("UPDATE users SET password_hash=? WHERE id=?", (security.hash_password(body.password), uid))
-        db.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
+    ph = security.hash_password(body.password) if body.password else None
+    with db.transaction() as tx:                      # all the changes together or none (a half-applied edit helped nobody)
+        vals = {}
+        if body.role:
+            vals["role"] = body.role
+        if body.disabled is not None:
+            vals["disabled"] = 1 if body.disabled else 0
+        if ph:
+            vals["password_hash"] = ph
+        tx.update(User, User.id == uid, **vals)
+        if body.disabled or ph:
+            tx.delete(UserSession, UserSession.user_id == uid)
+            tx.delete(LoginChallenge, LoginChallenge.user_id == uid)
     db.audit(user["email"], "user.edited", f"{target['email']} {body.model_dump(exclude={'password'}, exclude_none=True)}"
              + (" password reset" if body.password else ""), ip_of(request))
     return {"ok": True}
@@ -1169,7 +1237,9 @@ def users_patch(uid: int, body: UserPatch, request: Request, user: dict = Depend
 
 @router.get("/api/audit")
 def audit_list(limit: int = 50, offset: int = 0, q: str = "", user: dict = Depends(current_user)):
-    like = f"%{q}%"
-    rows = db.query("SELECT * FROM audit WHERE (?='' OR action LIKE ? OR detail LIKE ? OR user_email LIKE ?) ORDER BY id DESC LIMIT ? OFFSET ?",
-                    (q, like, like, like, min(limit, 200), offset))
+    conds = []
+    if q:
+        conds.append(or_(Audit.action.contains(q, autoescape=True), Audit.detail.contains(q, autoescape=True),
+                         Audit.user_email.contains(q, autoescape=True)))
+    rows = db.all(Audit, *conds, order=Audit.id.desc(), limit=max(1, min(limit, 200)), offset=max(0, offset))
     return {"items": rows}

@@ -1,0 +1,8 @@
+{% extends "base.html" %}{% import "_macros.html" as m %}
+{% block body %}
+{{ m.p(inviter ~ " invited you to the " ~ brand ~ " panel as " ~ role ~ ". Choose your name and a password to get started.") }}
+{{ m.facts([("Role", role|capitalize), ("Invited by", inviter), ("Expires", "in " ~ days ~ " days")]) }}
+{{ m.button("Accept invitation", link) }}
+{{ m.fallback(link) }}
+{{ m.small("This link works once. If you weren't expecting this invitation, you can safely ignore the email.") }}
+{% endblock %}

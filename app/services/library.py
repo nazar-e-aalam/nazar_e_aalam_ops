@@ -12,7 +12,11 @@ import urllib.parse
 import zipfile
 from pathlib import Path
 
-from ..core import config, db
+from sqlalchemy import func, select
+
+from ..core import config
+from ..db import db
+from ..db.models import App, Asset, Release
 from . import github as gh, setup
 
 ALLOWED_EXT = {".apk": "android", ".aab": "android", ".ipa": "ios", ".zip": "other", ".dmg": "other",
@@ -46,15 +50,15 @@ def clean_version(v: str) -> str:
 
 
 def ensure_default_app() -> None:
-    if not db.one("SELECT id FROM apps LIMIT 1"):
-        db.execute("INSERT INTO apps(slug,name,description,created_at) VALUES(?,?,?,?)",
-                   ("nazar-e-aalam", "Nazar e Aalam", "The Nazar e Aalam Islamic app.", time.time()))
+    if not db.exists(App):
+        db.insert(App, slug="nazar-e-aalam", name="Nazar e Aalam", description="The Nazar e Aalam Islamic app.",
+                  created_at=time.time())
 
 
 def get_app(slug_or_id):
     if isinstance(slug_or_id, int) or str(slug_or_id).isdigit():
-        return db.one("SELECT * FROM apps WHERE id=?", (int(slug_or_id),))
-    return db.one("SELECT * FROM apps WHERE slug=?", (slug_or_id,))
+        return db.get(App, App.id == int(slug_or_id))
+    return db.get(App, App.slug == slug_or_id)
 
 
 def create_app(name: str, slug: str = "", description: str = "") -> dict:
@@ -64,11 +68,10 @@ def create_app(name: str, slug: str = "", description: str = "") -> dict:
     slug = slugify(slug or name)
     if not slug or slug in RESERVED_SLUGS:
         raise ValueError("Choose a different slug")
-    if db.one("SELECT id FROM apps WHERE slug=?", (slug,)):
+    if db.exists(App, App.slug == slug):
         raise ValueError("An app with this slug already exists")
-    db.execute("INSERT INTO apps(slug,name,description,created_at) VALUES(?,?,?,?)",
-               (slug, name[:80], description.strip()[:400], time.time()))
-    return db.one("SELECT * FROM apps WHERE slug=?", (slug,))
+    db.insert(App, slug=slug, name=name[:80], description=description.strip()[:400], created_at=time.time())
+    return db.get(App, App.slug == slug)
 
 
 def _asset_dir(app: dict, version: str, platform: str) -> Path:
@@ -114,8 +117,8 @@ def _add_remote_asset(release_id: int, proxy_url, direct_url: str, size: int, sh
     """Store only URLs (gh-proxy + direct GitHub). Nothing is downloaded to this server."""
     ext = Path(filename).suffix.lower()
     ctype = MIME.get(ext) or mimetypes.guess_type(filename)[0] or "application/octet-stream"
-    db.execute("INSERT INTO assets(release_id,filename,size,sha256,path,content_type,remote_url,direct_url,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-               (release_id, filename, int(size or 0), sha, "", ctype, proxy_url or direct_url, direct_url, time.time()))
+    db.insert(Asset, release_id=release_id, filename=filename, size=int(size or 0), sha256=sha, path="", content_type=ctype,
+              remote_url=proxy_url or direct_url, direct_url=direct_url, created_at=time.time())
 
 
 def _attach_release_asset(rid: int, app: dict, version: str, platform: str, a: dict) -> bool:
@@ -133,8 +136,8 @@ def _attach_release_asset(rid: int, app: dict, version: str, platform: str, a: d
 def _add_asset(release_id: int, path: Path, size: int, sha: str, filename: str) -> None:
     ext = Path(filename).suffix.lower()
     ctype = MIME.get(ext) or mimetypes.guess_type(filename)[0] or "application/octet-stream"
-    db.execute("INSERT INTO assets(release_id,filename,size,sha256,path,content_type,created_at) VALUES(?,?,?,?,?,?,?)",
-               (release_id, filename, size, sha, str(path), ctype, time.time()))
+    db.insert(Asset, release_id=release_id, filename=filename, size=size, sha256=sha, path=str(path), content_type=ctype,
+              created_at=time.time())
 
 
 def _new_release(app: dict, version: str, platform: str, channel: str, notes: str, user: str, source: str,
@@ -143,17 +146,16 @@ def _new_release(app: dict, version: str, platform: str, channel: str, notes: st
         raise ValueError("Platform must be android, ios or other")
     if channel not in ("stable", "beta"):
         raise ValueError("Channel must be stable or beta")
-    old = db.one("SELECT id,status FROM releases WHERE app_id=? AND version=? AND platform=?", (app["id"], version, platform))
+    old = db.get(Release, Release.app_id == app["id"], Release.version == version, Release.platform == platform,
+                 cols=[Release.id, Release.status])
     if old:
         if old["status"] == "failed":
             delete_release(old["id"])
         else:
             raise ValueError(f"{app['name']} {version} ({platform}) already exists in the library")
-    return db.execute(
-        """INSERT INTO releases(app_id,version,platform,channel,notes,visible,status,source,source_ref,created_by,created_at,published_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (app["id"], version, platform, channel, notes.strip()[:20000], 1, status, source, source_ref, user,
-         time.time(), published_at or time.time()))
+    return db.insert(Release, app_id=app["id"], version=version, platform=platform, channel=channel,
+                     notes=notes.strip()[:20000], visible=1, status=status, source=source, source_ref=source_ref,
+                     created_by=user, created_at=time.time(), published_at=published_at or time.time())
 
 
 def add_upload(app: dict, version: str, platform: str, channel: str, notes: str, files: list, user: str) -> int:
@@ -171,7 +173,7 @@ def add_upload(app: dict, version: str, platform: str, channel: str, notes: str,
             dest = folder / fname
             size, sha = copy_limited(fobj, dest)
             _add_asset(rid, dest, size, sha, fname)
-        db.execute("UPDATE releases SET status='ready' WHERE id=?", (rid,))
+        db.update(Release, Release.id == rid, status="ready")
     except BaseException:
         delete_release(rid)
         raise
@@ -180,10 +182,12 @@ def add_upload(app: dict, version: str, platform: str, channel: str, notes: str,
 
 def delete_release(rid: int, ignore: bool = False) -> None:
     """ignore=True: a GitHub-synced release the admin deleted on purpose is not re-imported by the next sync."""
-    r = db.one("""SELECT r.version,r.platform,r.source,r.app_id,a.slug FROM releases r JOIN apps a ON a.id=r.app_id WHERE r.id=?""", (rid,))
+    r = db.select_one(select(Release.version, Release.platform, Release.source, Release.app_id, App.slug)
+                      .select_from(Release.__table__.join(App.__table__, App.id == Release.app_id))
+                      .where(Release.id == rid))
     if r and ignore and r["source"] == "github":
         _skip_add(f"{r['app_id']}|{r['version']}|{r['platform']}")
-    db.execute("DELETE FROM releases WHERE id=?", (rid,))
+    db.delete(Release, Release.id == rid)
     if r:
         shutil.rmtree(config.APPS_DIR / r["slug"] / r["version"] / r["platform"], ignore_errors=True)
         parent = config.APPS_DIR / r["slug"] / r["version"]
@@ -199,13 +203,13 @@ def _spawn(fn, *args) -> None:
 
 def _fail(rids: list, err: str) -> None:
     for rid in rids:
-        db.execute("UPDATE releases SET status='failed', error=? WHERE id=?", (err[:300], rid))
+        db.update(Release, Release.id == rid, status="failed", error=err[:300])
 
 
 # ---- import: GitHub release ------------------------------------------------------
 def github_releases() -> list:
     items = gh.jget(gh.repo_path("app") + "/releases", params={"per_page": 30}, ttl=20)
-    imported = {(r["source_ref"]) for r in db.query("SELECT source_ref FROM releases WHERE source='github' AND status!='failed'")}
+    imported = {(r["source_ref"]) for r in db.all(Release, Release.source == "github", Release.status != "failed", cols=[Release.source_ref])}
     out = []
     for r in items:
         assets = [{"id": a["id"], "name": a["name"], "size": a["size"], "downloads": a.get("download_count", 0)}
@@ -236,7 +240,7 @@ def import_github_release(tag: str, app: dict, user: str, notes: str = None) -> 
             for platform, items in groups.items():
                 for a in items:
                     _attach_release_asset(rids[platform], app, version, platform, a)
-                db.execute("UPDATE releases SET status='ready' WHERE id=?", (rids[platform],))
+                db.update(Release, Release.id == rids[platform], status="ready")
         except Exception as e:
             traceback.print_exc()
             _fail(list(rids.values()), getattr(e, "message", str(e)))
@@ -279,7 +283,7 @@ def import_artifact(repo_key: str, artifact_id: int, app: dict, version: str, pl
                 shutil.copyfile(tmp, dest)
                 size, sha = hash_file(dest)
                 _add_asset(rid, dest, size, sha, fname)
-            db.execute("UPDATE releases SET status='ready' WHERE id=?", (rid,))
+            db.update(Release, Release.id == rid, status="ready")
         except Exception as e:
             traceback.print_exc()
             _fail([rid], getattr(e, "message", str(e)))
@@ -307,21 +311,22 @@ def _vkey(v: str) -> tuple:
 
 
 def list_releases(app_id: int = None, public: bool = True) -> list:
-    where, args = [], []
+    conds = []
     if app_id:
-        where.append("r.app_id=?")
-        args.append(app_id)
+        conds.append(Release.app_id == app_id)
     if public:
-        where.append("r.visible=1 AND r.status='ready'")
-    rows = db.query(f"""SELECT r.*, a.slug AS app_slug, a.name AS app_name FROM releases r JOIN apps a ON a.id=r.app_id
-                        {'WHERE ' + ' AND '.join(where) if where else ''}
-                        ORDER BY COALESCE(r.published_at,r.created_at) DESC, r.id DESC""", tuple(args))
+        conds += [Release.visible == 1, Release.status == "ready"]
+    rows = db.select_rows(
+        select(*Release.__table__.c, App.slug.label("app_slug"), App.name.label("app_name"))
+        .select_from(Release.__table__.join(App.__table__, App.id == Release.app_id))
+        .where(*conds)
+        .order_by(func.coalesce(Release.published_at, Release.created_at).desc(), Release.id.desc()))
     if not rows:
         return []
     rows.sort(key=lambda r: (_vkey(r["version"]), r["published_at"] or r["created_at"], r["id"]), reverse=True)
-    ids = ",".join(str(r["id"]) for r in rows)
+    ids = [r["id"] for r in rows]
     by_rel: dict = {}
-    for a in db.query(f"SELECT * FROM assets WHERE release_id IN ({ids}) ORDER BY id"):
+    for a in db.all(Asset, Asset.release_id.in_(ids), order=Asset.id):
         by_rel.setdefault(a["release_id"], []).append(_asset_view(a))
     seen = set()
     for r in rows:
@@ -335,7 +340,7 @@ def list_releases(app_id: int = None, public: bool = True) -> list:
 
 
 def public_apps() -> list:
-    apps = db.query("SELECT id,slug,name,description FROM apps ORDER BY name")
+    apps = db.all(App, order=App.name, cols=[App.id, App.slug, App.name, App.description])
     rels = list_releases(public=True)
     for a in apps:
         mine = [r for r in rels if r["app_id"] == a["id"]]
@@ -401,7 +406,7 @@ def sync_busy() -> bool:
 
 
 def _sync_group(app: dict, rel: dict, version: str, platform: str, assets: list, user: str, st: dict) -> None:
-    existing = db.one("SELECT * FROM releases WHERE app_id=? AND version=? AND platform=?", (app["id"], version, platform))
+    existing = db.get(Release, Release.app_id == app["id"], Release.version == version, Release.platform == platform)
     if existing and existing["status"] == "importing":
         return
     body = rel.get("body") or ""
@@ -412,22 +417,23 @@ def _sync_group(app: dict, rel: dict, version: str, platform: str, assets: list,
         created = True
     else:
         rid = existing["id"]
-        have = {a["filename"] for a in db.query("SELECT filename FROM assets WHERE release_id=?", (rid,))}
+        have = {a["filename"] for a in db.all(Asset, Asset.release_id == rid, cols=[Asset.filename])}
         if existing["source"] == "github" and not existing["notes"] and body.strip():
-            db.execute("UPDATE releases SET notes=? WHERE id=?", (body.strip()[:20000], rid))
+            db.update(Release, Release.id == rid, notes=body.strip()[:20000])
     if have:  # keep already-copied links current (GitHub may have re-uploaded or resized a file)
         pub = gh.iso_to_epoch(rel.get("published_at"))
         if pub:
-            db.execute("UPDATE releases SET published_at=? WHERE id=? AND source='github'", (pub, rid))
+            db.update(Release, Release.id == rid, Release.source == "github", published_at=pub)
         for a in assets:
             if safe_filename(a["name"]) in have:
                 proxy_url, direct_url = gh.asset_links(a)
                 digest = a.get("digest") or ""
                 sha = digest.split(":", 1)[1] if digest.startswith("sha256:") else None
                 if direct_url:
-                    db.execute("UPDATE assets SET size=?, remote_url=?, direct_url=?, sha256=COALESCE(?,sha256) "
-                               "WHERE release_id=? AND filename=? AND remote_url IS NOT NULL",
-                               (int(a.get("size", 0)), proxy_url or direct_url, direct_url, sha, rid, safe_filename(a["name"])))
+                    db.update(Asset, Asset.release_id == rid, Asset.filename == safe_filename(a["name"]),
+                              Asset.remote_url.isnot(None),
+                              size=int(a.get("size", 0)), remote_url=proxy_url or direct_url, direct_url=direct_url,
+                              sha256=func.coalesce(sha, Asset.sha256))
     todo = [a for a in assets if safe_filename(a["name"]) not in have]
     if not todo:
         return
@@ -437,12 +443,12 @@ def _sync_group(app: dict, rel: dict, version: str, platform: str, assets: list,
             st["new_files"] += 1
         if created:
             st["new_releases"] += 1
-        db.execute("UPDATE releases SET status='ready', error=NULL WHERE id=?", (rid,))
+        db.update(Release, Release.id == rid, status="ready", error=None)
     except Exception as e:
         msg = getattr(e, "message", str(e))
         st["errors"].append(f"{rel['tag_name']} ({platform}): {msg}")
         if created:  # a failed row is deleted and retried by the next sync
-            db.execute("UPDATE releases SET status='failed', error=? WHERE id=?", (msg[:300], rid))
+            db.update(Release, Release.id == rid, status="failed", error=msg[:300])
 
 
 def sync_github(user: str = "github-sync") -> dict:
@@ -452,7 +458,7 @@ def sync_github(user: str = "github-sync") -> dict:
     st = {"at": time.time(), "ok": True, "checked": 0, "new_releases": 0, "new_files": 0, "removed": 0, "errors": []}
     try:
         cfg = sync_cfg()
-        app = get_app(cfg["app"]) if cfg["app"] else db.one("SELECT * FROM apps ORDER BY id LIMIT 1")
+        app = get_app(cfg["app"]) if cfg["app"] else db.get(App, order=App.id)
         if not app:
             raise ValueError("No app to sync into")
         st["app"] = app["slug"]
@@ -488,7 +494,8 @@ def sync_github(user: str = "github-sync") -> dict:
                 except ValueError as e:
                     st["errors"].append(f"{rel['tag_name']} ({platform}): {e}")
         # a release deleted/un-published (or whose files were removed) on GitHub disappears here too
-        for r in db.query("SELECT id,version,platform FROM releases WHERE app_id=? AND source='github' AND status='ready'", (app["id"],)):
+        for r in db.all(Release, Release.app_id == app["id"], Release.source == "github", Release.status == "ready",
+                    cols=[Release.id, Release.version, Release.platform]):
             if (r["version"], r["platform"]) not in wanted:
                 delete_release(r["id"])
                 st["removed"] += 1
@@ -505,7 +512,7 @@ def sync_github(user: str = "github-sync") -> dict:
 
 def recover_imports() -> None:
     """After a restart, imports that were mid-download can never finish: mark them failed so they are retried."""
-    db.execute("UPDATE releases SET status='failed', error='Interrupted by a restart' WHERE status='importing'")
+    db.update(Release, Release.status == "importing", status="failed", error="Interrupted by a restart")
 
 
 def start_sync() -> None:

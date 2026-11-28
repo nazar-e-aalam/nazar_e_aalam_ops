@@ -1,0 +1,7 @@
+{% extends "base.html" %}{% import "_macros.html" as m %}
+{% block body %}
+{{ m.p("We received a request to reset the password of your " ~ brand ~ " account. Press the button to choose a new one.") }}
+{{ m.button("Choose a new password", link) }}
+{{ m.fallback(link) }}
+{{ m.small("This link works once and expires in " ~ minutes ~ " minutes. If you didn't ask for it, ignore this email: your password stays the same. Two-factor codes, if you use them, are still required to sign in.") }}
+{% endblock %}

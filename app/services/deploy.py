@@ -10,8 +10,8 @@ Layout:       <deploy_root>/releases/<id>-<sha7>/   <deploy_root>/current -> rel
 import base64
 import hashlib
 import json
+import logging
 import os
-import posixpath
 import queue
 import re
 import shlex
@@ -26,12 +26,19 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from ..core import config, db, envstore
-from . import github as gh, setup, targets as tgs
+from ..core import config, envstore
+from ..db import db
+from ..db.models import Deployment
+from . import github as gh, notify, setup, targets as tgs
 
 STAGES = [("fetch", "Fetch commit"), ("env", "Write .env"), ("upload", "Upload to server"), ("venv", "Virtualenv"), ("install", "Install deps"),
           ("test", "Run tests"), ("prepare", "Pre-switch"), ("switch", "Switch release"),
           ("restart", "Restart"), ("health", "Health check"), ("cleanup", "Cleanup")]
+
+# a server set-up run (services/bootstrap.py): prepare the machine, then prove a real build works on it
+STAGES_BOOT = [("access", "Check access"), ("packages", "System packages"), ("python", "Python check"), ("folders", "Deploy folders"),
+               ("fetch", "Clone repository"), ("upload", "Upload to server"), ("venv", "Virtualenv"), ("install", "Install deps"),
+               ("test", "Run tests"), ("cleanup", "Cleanup")]
 
 DEFAULTS = {
     "branch": "main",
@@ -58,6 +65,7 @@ DEFAULTS = {
 started_at = time.time()
 _q: "queue.Queue[int]" = queue.Queue()
 _ctxs: dict = {}
+_secrets: dict = {}       # deployment id -> sudo password, memory only (never stored, never logged); used by server set-up runs
 _threads_started = False
 
 
@@ -103,33 +111,53 @@ def set_cfg(new: dict) -> dict:
 
 
 # ---- logging / process helpers -------------------------------------------------
-def _redact(s: str) -> str:
+def _redact(s: str, secrets_: tuple = ()) -> str:
     tok = gh.token()
     if tok:
         s = s.replace(tok, "***").replace(base64.b64encode(f"x-access-token:{tok}".encode()).decode(), "***")
+    for x in secrets_:
+        if x:
+            s = s.replace(x, "***")
     return s
 
 
+_LIVE: dict = {}                 # dep_id -> Log of the run that is executing right now (read by the live log view)
+_LOG_CAP = 2_000_000             # characters kept per run
+
+
 class Log:
+    """Output of one run: printed to the terminal as it happens, kept in memory for the live view, stored in the DB when done."""
+
     def __init__(self, dep_id: int):
-        self.path = config.LOG_DIR / f"deploy-{dep_id}.log"
-        self.f = open(self.path, "a", buffering=1, encoding="utf-8", errors="replace")
+        self.id, self.buf, self.secrets, self._lock = dep_id, "", [], threading.Lock()
+        _LIVE[dep_id] = self
 
     def write(self, line: str) -> None:
-        self.f.write(f"{time.strftime('%H:%M:%S')}  {_redact(line)}\n")
+        line = _redact(line, tuple(self.secrets))
+        out = f"{time.strftime('%H:%M:%S')}  {line}\n"
+        with self._lock:
+            if len(self.buf) < _LOG_CAP:
+                self.buf += out
+        for l in line.splitlines() or [""]:
+            print(f"\033[2m[run #{self.id}]\033[0m {l}", flush=True)
 
     def close(self) -> None:
-        self.f.close()
+        try:
+            db.update(Deployment, Deployment.id == self.id, log=self.buf)
+        except Exception:  # noqa: BLE001 - the run itself already finished; never fail on bookkeeping
+            logging.getLogger("ops.deploy").exception("could not store the log of run #%s", self.id)
+        _LIVE.pop(self.id, None)
 
 
 def read_log(dep_id: int, offset: int = 0):
-    p = config.LOG_DIR / f"deploy-{int(dep_id)}.log"
-    if not p.exists():
-        return "", 0
-    with open(p, "rb") as f:
-        f.seek(offset)
-        chunk = f.read(256 * 1024)
-    return chunk.decode("utf-8", "replace"), offset + len(chunk)
+    live = _LIVE.get(int(dep_id))
+    if live is not None:
+        text = live.buf
+    else:
+        row = db.get(Deployment, Deployment.id == int(dep_id), cols=[Deployment.log])
+        text = (row or {}).get("log") or ""
+    chunk = text[offset:offset + 256 * 1024]
+    return chunk, offset + len(chunk)
 
 
 class Ctx:
@@ -139,7 +167,7 @@ class Ctx:
         self.proc = None
         self.cancelled = False
         self.stages = {k: {"key": k, "label": l, "status": "pending", "detail": "", "started": None, "finished": None}
-                       for k, l in STAGES}
+                       for k, l in (STAGES_BOOT if kind == "bootstrap" else STAGES)}
 
     def stage(self, key: str, status: str, detail: str = None, label: str = None) -> None:
         s = self.stages.setdefault(key, {"key": key, "label": label or key, "status": "pending", "detail": "",
@@ -151,12 +179,13 @@ class Ctx:
         s["status"] = status
         if detail is not None:
             s["detail"] = detail
-        db.execute("UPDATE deployments SET stages=? WHERE id=?", (json.dumps(list(self.stages.values())), self.id))
+        db.update(Deployment, Deployment.id == self.id, stages=json.dumps(list(self.stages.values())))
 
 
 def _child_env(venv: Path | None = None) -> dict:
+    # the ops panel's own configuration (OPS_*, e.g. OPS_DB_PASSWORD) must never leak into the apps it deploys or their tests
     env = {k: v for k, v in os.environ.items()
-           if not k.startswith("OPS_") and k not in ("VIRTUAL_ENV", "PYTHONHOME", "PYTHONPATH")}
+           if not k.startswith("OPS_") and k not in ("DATABASE_URL", "VIRTUAL_ENV", "PYTHONHOME", "PYTHONPATH")}
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["PYTHONUNBUFFERED"] = "1"
     if venv:
@@ -228,38 +257,40 @@ class Blocked(Exception):
         super().__init__("Deployment blocked: " + "; ".join(p["title"] for p in problems))
 
 
-def enqueue(commit: dict, user: str, trigger: str = "manual", kind: str = "deploy", release: str = None, target_id: int = 0) -> int:
+def enqueue(commit: dict, user: str, trigger: str = "manual", kind: str = "deploy", release: str = None, target_id: int = 0,
+            secret: str = "") -> int:
     if kind == "deploy":
-        dup = db.one("SELECT id FROM deployments WHERE sha=? AND kind='deploy' AND target_id=? AND status IN ('queued','running')",
-                     (commit["sha"], target_id))
+        dup = db.get(Deployment, Deployment.sha == commit["sha"], Deployment.kind == "deploy", Deployment.target_id == target_id,
+                     Deployment.status.in_(("queued", "running")), cols=[Deployment.id])
         if dup:
             return dup["id"]
         pf = preflight(target_id)
         if not pf["ok"]:
             raise Blocked(pf["problems"])
     stages = [{"key": k, "label": l, "status": "pending", "detail": "", "started": None, "finished": None}
-              for k, l in STAGES]
-    dep_id = db.execute(
-        """INSERT INTO deployments(kind,status,sha,short_sha,message,author,branch,trigger,triggered_by,queued_at,release_name,stages,target_id)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (kind, "queued", commit.get("sha"), (commit.get("sha") or "")[:7], commit.get("message", ""),
-         commit.get("author", ""), commit.get("branch", ""), trigger, user, time.time(), release, json.dumps(stages), int(target_id)))
+              for k, l in (STAGES_BOOT if kind == "bootstrap" else STAGES)]
+    dep_id = db.insert(Deployment, kind=kind, status="queued", sha=commit.get("sha"), short_sha=(commit.get("sha") or "")[:7],
+                       message=commit.get("message", ""), author=commit.get("author", ""), branch=commit.get("branch", ""),
+                       trigger=trigger, triggered_by=user, queued_at=time.time(), release_name=release, stages=json.dumps(stages),
+                       target_id=int(target_id))
+    if secret:
+        _secrets[dep_id] = secret      # before the worker can see the job
     _q.put(dep_id)
     return dep_id
 
 
 def cancel(dep_id: int) -> str:
-    d = db.one("SELECT status FROM deployments WHERE id=?", (dep_id,))
+    d = db.get(Deployment, Deployment.id == dep_id, cols=[Deployment.status])
     if not d:
         raise ValueError("Deployment not found")
     if d["status"] == "queued":
-        db.execute("UPDATE deployments SET status='cancelled', finished_at=? WHERE id=? AND status='queued'",
-                   (time.time(), dep_id))
+        db.update(Deployment, Deployment.id == dep_id, Deployment.status == "queued", status="cancelled", finished_at=time.time())
+        _secrets.pop(dep_id, None)
         return "Cancelled before it started."
     ctx = _ctxs.get(dep_id)
     if d["status"] != "running" or not ctx:
         raise ValueError("This deployment is not running.")
-    if ctx.stages["switch"]["status"] != "pending" and ctx.kind == "deploy":
+    if ctx.kind == "deploy" and ctx.stages["switch"]["status"] != "pending":
         raise ValueError("Too late to cancel: the release is already switched. Use Roll back instead.")
     ctx.cancelled = True
     if ctx.proc:
@@ -312,7 +343,7 @@ def eff_cfg(cfg: dict, t: dict) -> dict:
     c = dict(cfg)
     if t.get("root"):
         c["deploy_root"] = t["root"]
-    for k in ("restart_cmd", "health_url"):
+    for k in ("restart_cmd", "health_url", "python"):
         if (t.get(k) or "").strip():
             c[k] = t[k].strip()
     return c
@@ -326,6 +357,10 @@ class LocalExec:
 
     def run(self, ctx, cmd, cwd, timeout, venv=None, show=None):
         return run(ctx, cmd, Path(cwd), _child_env(Path(venv) if venv else None), timeout, show)
+
+    def run_script(self, ctx, script, cwd, timeout, show):
+        """Run a multi-line bash script fed through stdin (so secrets never appear in a process list)."""
+        return _stream(ctx, ["bash", "-s"], Path(cwd), _child_env(), timeout, show, stdin_text=script)
 
     def capture(self, cmd, timeout=30):
         try:
@@ -376,6 +411,13 @@ class SshExec:
         except tgs.TargetError as e:
             raise Failure(str(e))
         return _stream(ctx, base + ["bash -s"], "/", _child_env(), timeout, f"[{self.t['host']}] {show or text}", stdin_text=pre + text + "\n")
+
+    def run_script(self, ctx, script, cwd, timeout, show):
+        try:
+            base = self._base()
+        except tgs.TargetError as e:
+            raise Failure(str(e))
+        return _stream(ctx, base + ["bash -s"], "/", _child_env(), timeout, f"[{self.t['host']}] {show}", stdin_text=script)
 
     def capture(self, cmd, timeout=30):
         try:
@@ -504,16 +546,12 @@ def preflight(target_id: int = 0) -> dict:
         if not chk.get("ok"):
             bad = [c["label"] for c in chk.get("checks", []) if c["ok"] is False]
             probs.append(_prob("access", "This server is not ready to deploy", ", ".join(bad) or "Run the access check.", href))
-    miss = tgs.db_complete(t)
-    if miss:
-        probs.append(_prob("db", "External database settings are incomplete", "Missing: " + ", ".join(miss), href))
     if cfg["require_env"]:
         cur = envstore.current()
         if not cur:
             probs.append(_prob("env", "No environment (.env) has been added yet", "Add the variables your app needs in the Environment tab.", "#/env"))
         else:
             have = dict(envstore.parse(cur["content"])[0])
-            have.update(tgs.env_overrides(t))
             missing = [k for k in required_env_keys(cfg) if not have.get(k)]
             if missing:
                 probs.append(_prob("env_missing", f"{len(missing)} required environment variable(s) are empty or missing",
@@ -623,11 +661,6 @@ def _write_env(ctx: Ctx, cfg: dict, d: dict, rel: Path, t: dict) -> None:
         ctx.stage("env", "skipped", "none uploaded")
         return
     content = cur["content"]
-    over = tgs.env_overrides(t)
-    if over:
-        content = envstore.apply(content, over)
-        c = tgs.db_cfg(t)
-        ctx.log.write(f"External {c['engine']} database from server '{t['name']}': {c['host']}:{c['port']}/{c['name']} (user {c['user']}), {len(over)} keys written")
     if cfg["require_env"]:
         have = dict(envstore.parse(content)[0])
         need = sorted(set(required_env_keys(cfg)) | set(example_required))
@@ -641,7 +674,7 @@ def _write_env(ctx: Ctx, cfg: dict, d: dict, rel: Path, t: dict) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
     target.chmod(0o600)
-    db.execute("UPDATE deployments SET env_version=? WHERE id=?", (cur["version"], d["id"]))
+    db.update(Deployment, Deployment.id == d["id"], env_version=cur["version"])
     n = len(envstore.parse(content)[0])
     ctx.log.write(f"Wrote {cfg['env_target']} (version {cur['version']}, {n} keys)")
     ctx.stage("env", "success", f"v{cur['version']} · {n} keys")
@@ -679,6 +712,25 @@ def _prepare_venv(ctx: Ctx, cfg: dict, tg, root: str, rel: str, lrel: Path) -> s
     return venv
 
 
+def run_tests(ctx: Ctx, cfg: dict, tg, rel: str, venv: str, what: str = "the running version was not touched") -> None:
+    """Run the configured test command inside the release's virtualenv. Raises Failure when it fails."""
+    if not (cfg["test_enabled"] and cfg["test_cmd"]):
+        ctx.stage("test", "skipped", "disabled")
+        return
+    ctx.stage("test", "running", cfg["test_cmd"])
+    rc = tg.run(ctx, cfg["test_cmd"], rel, cfg["command_timeout"], venv=venv)
+    if rc == 5 and "pytest" in cfg["test_cmd"]:
+        ctx.log.write("pytest collected no tests; treating as a pass.")
+        ctx.stage("test", "success", "no tests found")
+    elif rc != 0:
+        ctx.log.write("Tip: tests run inside the virtualenv built from requirements.txt, so the test tool "
+                      "(e.g. pytest) must be listed there or installed by your install command.")
+        ctx.stage("test", "failed", f"exit {rc}")
+        raise Failure(f"Tests failed ({cfg['test_cmd']} exited with {rc}), {what}")
+    else:
+        ctx.stage("test", "success")
+
+
 def _do_deploy(ctx: Ctx, d: dict, cfg: dict, tg, t: dict) -> None:
     root = cfg["deploy_root"]
     tg.mkdirs(f"{root}/releases")
@@ -686,7 +738,7 @@ def _do_deploy(ctx: Ctx, d: dict, cfg: dict, tg, t: dict) -> None:
     rel = f"{root}/releases/{name}"
     lrel = (config.DATA_DIR / "stage" / name) if tg.remote else Path(rel)
     prev = tg.active(root)
-    db.execute("UPDATE deployments SET release_name=?, prev_release=? WHERE id=?", (name, prev, d["id"]))
+    db.update(Deployment, Deployment.id == d["id"], release_name=name, prev_release=prev)
     try:
         _fetch(ctx, cfg, d, lrel)
         _write_env(ctx, cfg, d, lrel, t)
@@ -698,21 +750,7 @@ def _do_deploy(ctx: Ctx, d: dict, cfg: dict, tg, t: dict) -> None:
             ctx.stage("upload", "skipped", "same server")
         venv = _prepare_venv(ctx, cfg, tg, root, rel, lrel)
 
-        if cfg["test_enabled"] and cfg["test_cmd"]:
-            ctx.stage("test", "running")
-            rc = tg.run(ctx, cfg["test_cmd"], rel, cfg["command_timeout"], venv=venv)
-            if rc == 5 and "pytest" in cfg["test_cmd"]:
-                ctx.log.write("pytest collected no tests; treating as a pass.")
-                ctx.stage("test", "success", "no tests found")
-            elif rc != 0:
-                ctx.log.write("Tip: tests run inside the virtualenv built from requirements.txt, so the test tool "
-                              "(e.g. pytest) must be listed there or installed by your install command.")
-                ctx.stage("test", "failed", f"exit {rc}")
-                raise Failure("Tests failed, the running version was not touched")
-            else:
-                ctx.stage("test", "success")
-        else:
-            ctx.stage("test", "skipped", "disabled")
+        run_tests(ctx, cfg, tg, rel, venv)
 
         if cfg["pre_switch_cmd"]:
             ctx.stage("prepare", "running")
@@ -734,7 +772,7 @@ def _do_deploy(ctx: Ctx, d: dict, cfg: dict, tg, t: dict) -> None:
         except Failure as e:
             ctx.log.write(f"{e}. Restoring previous release…")
             ok = _revert(ctx, cfg, tg, root, prev)
-            db.execute("UPDATE deployments SET rolled_back=? WHERE id=?", (1 if ok else 0, d["id"]))
+            db.update(Deployment, Deployment.id == d["id"], rolled_back=1 if ok else 0)
             raise Failure(f"{e}. " + (f"Rolled back to {prev}." if ok else "Automatic rollback also failed, check the server!"))
         tg.cleanup(ctx, cfg, root)
     finally:
@@ -748,7 +786,7 @@ def _do_rollback(ctx: Ctx, d: dict, cfg: dict, tg, t: dict) -> None:
     if not tg.is_dir(f"{root}/releases/{target}"):
         raise Failure(f"Release {target} no longer exists on {t['name']}")
     prev = tg.active(root)
-    db.execute("UPDATE deployments SET prev_release=? WHERE id=?", (prev, d["id"]))
+    db.update(Deployment, Deployment.id == d["id"], prev_release=prev)
     for k in ("fetch", "env", "upload", "venv", "install", "test", "prepare", "cleanup"):
         ctx.stage(k, "skipped")
     ctx.stage("switch", "running")
@@ -791,13 +829,14 @@ def _cleanup(ctx: Ctx, cfg: dict, root: Path) -> None:
 
 
 def execute(dep_id: int) -> None:
-    d = db.one("SELECT * FROM deployments WHERE id=?", (dep_id,))
+    d = db.get(Deployment, Deployment.id == dep_id)
     if not d or d["status"] != "queued":
+        _secrets.pop(dep_id, None)
         return
     ctx = Ctx(dep_id, d["kind"])
     _ctxs[dep_id] = ctx
-    db.execute("UPDATE deployments SET status='running', started_at=? WHERE id=?", (time.time(), dep_id))
-    status, error = "success", None
+    db.update(Deployment, Deployment.id == dep_id, status="running", started_at=time.time())
+    status, error, t = "success", None, None
     try:
         t = tgs.get(d.get("target_id") or 0)
         if not t:
@@ -805,10 +844,18 @@ def execute(dep_id: int) -> None:
         cfg = eff_cfg(get_cfg(), t)
         tg = executor(t)
         root = cfg["deploy_root"]
-        tg.mkdirs(root)
-        ctx.log.write(f"{'Rollback' if d['kind'] == 'rollback' else 'Deployment'} #{dep_id} "
-                      f"{d['short_sha'] or ''} {d['message'] or ''} -> {t['name']}".strip())
-        (_do_rollback if d["kind"] == "rollback" else _do_deploy)(ctx, d, cfg, tg, t)
+        if d["kind"] == "bootstrap":
+            from . import bootstrap
+            pw = _secrets.pop(dep_id, "")
+            if pw:
+                ctx.log.secrets.append(pw)
+            ctx.log.write(f"Server set-up #{dep_id} -> {t['name']}")
+            bootstrap.run(ctx, d, cfg, tg, t, pw)
+        else:
+            tg.mkdirs(root)
+            ctx.log.write(f"{'Rollback' if d['kind'] == 'rollback' else 'Deployment'} #{dep_id} "
+                          f"{d['short_sha'] or ''} {d['message'] or ''} -> {t['name']}".strip())
+            (_do_rollback if d["kind"] == "rollback" else _do_deploy)(ctx, d, cfg, tg, t)
         ctx.log.write("Done.")
     except Failure as e:
         status, error = ("cancelled" if ctx.cancelled else "failed"), str(e)
@@ -817,18 +864,24 @@ def execute(dep_id: int) -> None:
         status, error = "failed", f"{type(e).__name__}: {e}"
         ctx.log.write("UNEXPECTED ERROR:\n" + traceback.format_exc())
     finally:
+        _secrets.pop(dep_id, None)
+        failed_stage = next((s["label"] for s in ctx.stages.values() if s["status"] == "failed"), "")
         for s in ctx.stages.values():
             if s["status"] == "running":
                 s["status"] = "failed" if status != "success" else "success"
-        ctx.stage("fetch", ctx.stages["fetch"]["status"])  # persist final stage state
         for s in ctx.stages.values():
             if s["status"] == "pending" and status != "success":
                 s["status"] = "skipped"
-        db.execute("UPDATE deployments SET status=?, error=?, finished_at=?, stages=? WHERE id=?",
-                   (status, error, time.time(), json.dumps(list(ctx.stages.values())), dep_id))
+        db.update(Deployment, Deployment.id == dep_id, status=status, error=error, finished_at=time.time(),
+                  stages=json.dumps(list(ctx.stages.values())))
         ctx.log.close()
         _ctxs.pop(dep_id, None)
-        db.audit(d["triggered_by"], f"deploy.{status}", f"#{dep_id} {d['short_sha'] or d['release_name'] or ''}")
+        db.audit(d["triggered_by"], f"{d['kind'] if d['kind'] == 'bootstrap' else 'deploy'}.{status}",
+                 f"#{dep_id} {d['short_sha'] or d['release_name'] or ''}")
+        try:
+            notify.run_finished(d, status, error, t, failed_stage)
+        except Exception:  # a broken mail server must never break a deployment
+            traceback.print_exc()
 
 
 # ---- workers -------------------------------------------------------------------
@@ -853,7 +906,7 @@ def _poller() -> None:
             commit = resolve_commit(cfg["branch"])
             seen = db.sget("deploy_last_seen")
             if seen is None:
-                row = db.one("SELECT sha FROM deployments WHERE kind='deploy' AND status='success' ORDER BY id DESC LIMIT 1")
+                row = db.get(Deployment, Deployment.kind == "deploy", Deployment.status == "success", order=Deployment.id.desc(), cols=[Deployment.sha])
                 seen = row["sha"] if row else ""
             if commit["sha"] != seen:
                 db.sset("deploy_last_seen", commit["sha"])
@@ -876,10 +929,14 @@ def start() -> None:
     if _threads_started:
         return
     _threads_started = True
-    db.execute("UPDATE deployments SET status='failed', error='Interrupted: the ops panel restarted', finished_at=? "
-               "WHERE status='running'", (time.time(),))
-    for r in db.query("SELECT id FROM deployments WHERE status='queued' ORDER BY id"):
-        _q.put(r["id"])
+    db.update(Deployment, Deployment.status == "running", status="failed", error="Interrupted: the ops panel restarted",
+              finished_at=time.time())
+    for r in db.all(Deployment, Deployment.status == "queued", order=Deployment.id, cols=[Deployment.id, Deployment.kind]):
+        if r["kind"] == "bootstrap":      # needs the sudo password, which was only in memory
+            db.update(Deployment, Deployment.id == r["id"], status="failed", error="Interrupted: the ops panel restarted. Run the server set-up again.",
+                      finished_at=time.time())
+        else:
+            _q.put(r["id"])
     threading.Thread(target=_worker, name="deploy-worker", daemon=True).start()
     threading.Thread(target=_poller, name="deploy-poller", daemon=True).start()
 
@@ -941,8 +998,10 @@ def releases_on_disk(target_id: int = 0) -> list:
     t = tgs.get(target_id) or tgs.get(0)
     cfg = eff_cfg(get_cfg(), t)
     root = cfg["deploy_root"]
-    by_name = {r["release_name"]: r for r in db.query(
-        "SELECT release_name,id,sha,short_sha,message,author,finished_at,status FROM deployments WHERE kind='deploy' AND release_name IS NOT NULL AND target_id=?", (t["id"],))}
+    by_name = {r["release_name"]: r for r in db.all(
+        Deployment, Deployment.kind == "deploy", Deployment.release_name.isnot(None), Deployment.target_id == t["id"],
+        cols=[Deployment.release_name, Deployment.id, Deployment.sha, Deployment.short_sha, Deployment.message, Deployment.author,
+              Deployment.finished_at, Deployment.status])}
     if t["kind"] == "local":
         rel_dir = Path(root) / "releases"
         if not rel_dir.is_dir():
@@ -1035,7 +1094,7 @@ def server_status(target_id: int = 0) -> dict:
     root = Path(cfg["deploy_root"])
     base = {"target": {"id": t["id"], "name": t["name"], "kind": t["kind"], "host": t.get("host") or ""}, "deploy_root": str(root),
             "ops_uptime": time.time() - started_at, "poll": db.sget("deploy_poll"),
-            "busy": bool(db.one("SELECT id FROM deployments WHERE status IN ('queued','running') LIMIT 1"))}
+            "busy": db.exists(Deployment, Deployment.status.in_(("queued", "running")))}
     if t["kind"] == "ssh":
         r = _remote_status(t, cfg)
         active = r.get("active")
@@ -1054,14 +1113,17 @@ def server_status(target_id: int = 0) -> dict:
         except OSError:
             load = None
         mem, health, root_exists = _meminfo(), probe(cfg["health_url"]), root.exists()
-    cur = db.one("SELECT id,sha,short_sha,message,author,finished_at,env_version FROM deployments "
-                 "WHERE kind='deploy' AND release_name=? AND target_id=? ORDER BY id DESC LIMIT 1", (active, t["id"])) if active else None
+    cur = db.get(Deployment, Deployment.kind == "deploy", Deployment.release_name == active, Deployment.target_id == t["id"],
+                 order=Deployment.id.desc(),
+                 cols=[Deployment.id, Deployment.sha, Deployment.short_sha, Deployment.message, Deployment.author,
+                       Deployment.finished_at, Deployment.env_version]) if active else None
     base.update({"root_exists": root_exists, "active": active, "current": cur, "health": health, "load": load, "mem": mem, "disk": disk})
     return base
 
 
 def shape(d: dict) -> dict:
     d = dict(d)
+    d.pop("log", None)               # can be large: served only by /api/deploy/{id}/log
     try:
         d["stages"] = json.loads(d.get("stages") or "[]")
     except ValueError:

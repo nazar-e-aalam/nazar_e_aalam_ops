@@ -4,8 +4,6 @@ many open browsers share one upstream call, redirect-safe downloads (the token i
 never sent to the signed storage URL), and token verification."""
 import hashlib
 import json
-import os
-import shutil
 import threading
 import time
 import urllib.error
@@ -13,7 +11,8 @@ import urllib.parse
 import urllib.request
 from email.utils import parsedate_to_datetime
 
-from ..core import config, db
+from ..core import config
+from ..db import db
 
 REDIRECTS = (301, 302, 303, 307, 308)
 

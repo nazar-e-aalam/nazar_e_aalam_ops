@@ -1,0 +1,5 @@
+{% extends "base.html" %}{% import "_macros.html" as m %}
+{% block body %}
+{{ m.p("Your email settings work. Invitations, password resets and deployment alerts will arrive like this.") }}
+{{ m.facts([("Server", host), ("Sent", sent_at)]) }}
+{% endblock %}

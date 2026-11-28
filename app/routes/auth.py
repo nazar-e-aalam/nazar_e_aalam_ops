@@ -5,7 +5,11 @@ import time
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 
-from ..core import config, db, mailer, qr, security, totp
+from sqlalchemy import select
+
+from ..core import config, mailer, qr, security, totp
+from ..db import db
+from ..db.models import Invite, LoginChallenge, PasswordReset, RecoveryCode, User, UserSession
 from .ops import (accept_second_factor, admin_only, csrf, current_user, ip_of, security_cfg, start_session,
                          user_view)
 
@@ -50,7 +54,7 @@ def options():
 
 
 def _live_invite(token: str):
-    row = db.one("SELECT * FROM invites WHERE token_hash=?", (security.token_hash(token or ""),))
+    row = db.get(Invite, Invite.token_hash == security.token_hash(token or ""))
     if not row or row["used_at"] or row["revoked"] or row["expires_at"] < time.time():
         return None
     return row
@@ -86,19 +90,21 @@ def accept_invite(body: AcceptBody, request: Request, response: Response):
     _passwords(body.password, body.confirm_password)
     ph = security.hash_password(body.password)
     with db.transaction() as c:
-        row = c.execute("SELECT * FROM invites WHERE token_hash=? AND used_at IS NULL AND revoked=0 AND expires_at>?",
-                        (security.token_hash(body.token), time.time())).fetchone()
+        row = c.get(Invite, Invite.token_hash == security.token_hash(body.token), Invite.used_at.is_(None),
+                    Invite.revoked == 0, Invite.expires_at > time.time())
         if not row:
             security.note_failure(key)
             raise HTTPException(404, "This invitation link is invalid or has expired. Ask an admin to send a new one.")
-        if c.execute("SELECT 1 FROM users WHERE email=?", (row["email"],)).fetchone():
+        if c.exists(User, User.email == row["email"]):
             raise HTTPException(400, "An account with this email already exists. Sign in instead.")
-        uid = c.execute("INSERT INTO users(email,name,first_name,last_name,password_hash,role,created_at) VALUES(?,?,?,?,?,?,?)",
-                        (row["email"], f"{first} {last}", first, last, ph, row["role"], time.time())).lastrowid
-        c.execute("UPDATE invites SET used_at=? WHERE id=?", (time.time(), row["id"]))
+        if c.update(Invite, Invite.id == row["id"], Invite.used_at.is_(None), used_at=time.time()) != 1:
+            security.note_failure(key)
+            raise HTTPException(404, "This invitation link is invalid or has expired. Ask an admin to send a new one.")
+        uid = c.insert(User, email=row["email"], name=f"{first} {last}", first_name=first, last_name=last,
+                       password_hash=ph, role=row["role"], created_at=time.time())
     start_session(uid, request, response)
     db.audit(row["email"], "invite.accepted", f"role {row['role']}", ip_of(request))
-    return {"user": user_view(db.one("SELECT * FROM users WHERE id=?", (uid,)))}
+    return {"user": user_view(db.get(User, User.id == uid))}
 
 
 class ForgotBody(BaseModel):
@@ -107,9 +113,9 @@ class ForgotBody(BaseModel):
 
 def _send_reset(user: dict) -> str:
     token = security.new_token()
-    db.execute("UPDATE password_resets SET used_at=? WHERE user_id=? AND used_at IS NULL", (time.time(), user["id"]))
-    db.execute("INSERT INTO password_resets(token_hash,user_id,created_at,expires_at) VALUES(?,?,?,?)",
-               (security.token_hash(token), user["id"], time.time(), time.time() + RESET_MINUTES * 60))
+    db.update(PasswordReset, PasswordReset.user_id == user["id"], PasswordReset.used_at.is_(None), used_at=time.time())
+    db.insert(PasswordReset, token_hash=security.token_hash(token), user_id=user["id"], created_at=time.time(),
+              expires_at=time.time() + RESET_MINUTES * 60)
     return _link("reset-password", token)
 
 
@@ -123,7 +129,7 @@ def forgot(body: ForgotBody, request: Request):
         raise HTTPException(429, "Too many requests. Try again later.")
     security.note_failure(key)          # every request counts: stops using this form to spam inboxes
     email = (body.email or "").strip().lower()
-    u = db.one("SELECT * FROM users WHERE email=? AND disabled=0", (email,)) if "@" in email else None
+    u = db.get(User, User.email == email, User.disabled == 0) if "@" in email else None
     if u:
         link = _send_reset(u)
         subject, text, html = mailer.reset_email(link, RESET_MINUTES)
@@ -139,14 +145,20 @@ def forgot(body: ForgotBody, request: Request):
     return {"ok": True}
 
 
+def _reset_select(th: str):
+    """Live (unused, unexpired) reset token joined with its enabled user's email."""
+    return (select(*PasswordReset.__table__.columns, User.email)
+            .select_from(PasswordReset.__table__.join(User.__table__, User.id == PasswordReset.user_id))
+            .where(PasswordReset.token_hash == th, PasswordReset.used_at.is_(None),
+                   PasswordReset.expires_at > time.time(), User.disabled == 0))
+
+
 @router.get("/api/auth/reset")
 def reset_info(token: str, request: Request):
     key = f"{ip_of(request)}|reset"
     if security.throttled(key):
         raise HTTPException(429, "Too many attempts. Try again later.")
-    row = db.one("""SELECT r.*,u.email FROM password_resets r JOIN users u ON u.id=r.user_id
-                    WHERE r.token_hash=? AND r.used_at IS NULL AND r.expires_at>? AND u.disabled=0""",
-                 (security.token_hash(token or ""), time.time()))
+    row = db.select_one(_reset_select(security.token_hash(token or "")))
     if not row:
         security.note_failure(key)
         raise HTTPException(404, "This reset link is invalid or has expired. Request a new one.")
@@ -168,16 +180,18 @@ def reset_password(body: ResetBody, request: Request):
     _passwords(body.password, body.confirm_password)
     ph = security.hash_password(body.password)
     with db.transaction() as c:
-        row = c.execute("""SELECT r.*,u.email FROM password_resets r JOIN users u ON u.id=r.user_id
-                           WHERE r.token_hash=? AND r.used_at IS NULL AND r.expires_at>? AND u.disabled=0""",
-                        (security.token_hash(body.token), time.time())).fetchone()
+        row = c.first(_reset_select(security.token_hash(body.token)))
         if not row:
             security.note_failure(key)
             raise HTTPException(404, "This reset link is invalid or has expired. Request a new one.")
-        c.execute("UPDATE users SET password_hash=? WHERE id=?", (ph, row["user_id"]))
-        c.execute("UPDATE password_resets SET used_at=? WHERE user_id=? AND used_at IS NULL", (time.time(), row["user_id"]))
-        c.execute("DELETE FROM sessions WHERE user_id=?", (row["user_id"],))
-        c.execute("DELETE FROM login_challenges WHERE user_id=?", (row["user_id"],))
+        if c.update(PasswordReset, PasswordReset.token_hash == row["token_hash"], PasswordReset.used_at.is_(None),
+                    used_at=time.time()) != 1:
+            security.note_failure(key)
+            raise HTTPException(404, "This reset link is invalid or has expired. Request a new one.")
+        c.update(User, User.id == row["user_id"], password_hash=ph)
+        c.update(PasswordReset, PasswordReset.user_id == row["user_id"], PasswordReset.used_at.is_(None), used_at=time.time())
+        c.delete(UserSession, UserSession.user_id == row["user_id"])
+        c.delete(LoginChallenge, LoginChallenge.user_id == row["user_id"])
     db.audit(row["email"], "password.reset", "via email link", ip_of(request))
     return {"ok": True}      # signing in afterwards still asks for the 2FA code
 
@@ -196,9 +210,9 @@ def _invite_out(row: dict, link: str | None = None, sent: bool = False, error: s
 def _issue_invite(email: str, role: str, inviter: dict) -> dict:
     token = security.new_token()
     now = time.time()
-    db.execute("UPDATE invites SET revoked=1 WHERE email=? AND used_at IS NULL AND revoked=0", (email,))
-    iid = db.execute("INSERT INTO invites(token_hash,email,role,invited_by,created_at,expires_at) VALUES(?,?,?,?,?,?)",
-                     (security.token_hash(token), email, role, inviter["name"] or inviter["email"], now, now + INVITE_DAYS * 86400))
+    db.update(Invite, Invite.email == email, Invite.used_at.is_(None), Invite.revoked == 0, revoked=1)
+    iid = db.insert(Invite, token_hash=security.token_hash(token), email=email, role=role,
+                    invited_by=inviter["name"] or inviter["email"], created_at=now, expires_at=now + INVITE_DAYS * 86400)
     link = _link("accept-invite", token)
     sent, error = False, None
     if mailer.configured():
@@ -206,10 +220,10 @@ def _issue_invite(email: str, role: str, inviter: dict) -> dict:
         try:
             mailer.send(email, subject, text, html)
             sent = True
-            db.execute("UPDATE invites SET emailed=1 WHERE id=?", (iid,))
+            db.update(Invite, Invite.id == iid, emailed=1)
         except mailer.MailError as e:
             error = str(e)
-    return _invite_out(db.one("SELECT * FROM invites WHERE id=?", (iid,)), link, sent, error)
+    return _invite_out(db.get(Invite, Invite.id == iid), link, sent, error)
 
 
 @router.post("/api/invites")
@@ -217,7 +231,7 @@ def invite_create(body: InviteBody, request: Request, user: dict = Depends(admin
     email = _email(body.email)
     if body.role not in ROLES:
         raise HTTPException(400, "Role must be admin, operator or viewer")
-    if db.one("SELECT id FROM users WHERE email=?", (email,)):
+    if db.exists(User, User.email == email):
         raise HTTPException(400, "A user with this email already exists")
     out = _issue_invite(email, body.role, user)
     db.audit(user["email"], "invite.sent" if out["sent"] else "invite.created", f"{email} ({body.role})", ip_of(request))
@@ -226,7 +240,7 @@ def invite_create(body: InviteBody, request: Request, user: dict = Depends(admin
 
 @router.get("/api/invites")
 def invite_list(user: dict = Depends(admin_only)):
-    rows = db.query("SELECT * FROM invites WHERE used_at IS NULL AND revoked=0 ORDER BY id DESC")
+    rows = db.all(Invite, Invite.used_at.is_(None), Invite.revoked == 0, order=Invite.id.desc())
     now = time.time()
     return [dict(_invite_out(r), expired=r["expires_at"] < now, emailed=bool(r["emailed"]), invited_by=r["invited_by"],
                  created_at=r["created_at"]) for r in rows]
@@ -234,10 +248,10 @@ def invite_list(user: dict = Depends(admin_only)):
 
 @router.post("/api/invites/{iid}/resend")
 def invite_resend(iid: int, request: Request, user: dict = Depends(admin_only)):
-    row = db.one("SELECT * FROM invites WHERE id=? AND used_at IS NULL AND revoked=0", (iid,))
+    row = db.get(Invite, Invite.id == iid, Invite.used_at.is_(None), Invite.revoked == 0)
     if not row:
         raise HTTPException(404, "Invitation not found")
-    if db.one("SELECT id FROM users WHERE email=?", (row["email"],)):
+    if db.exists(User, User.email == row["email"]):
         raise HTTPException(400, "A user with this email already exists")
     out = _issue_invite(row["email"], row["role"], user)      # a fresh link; the old one stops working
     db.audit(user["email"], "invite.resent", row["email"], ip_of(request))
@@ -246,17 +260,17 @@ def invite_resend(iid: int, request: Request, user: dict = Depends(admin_only)):
 
 @router.delete("/api/invites/{iid}")
 def invite_revoke(iid: int, request: Request, user: dict = Depends(admin_only)):
-    row = db.one("SELECT * FROM invites WHERE id=?", (iid,))
+    row = db.get(Invite, Invite.id == iid)
     if not row:
         raise HTTPException(404, "Invitation not found")
-    db.execute("UPDATE invites SET revoked=1 WHERE id=?", (iid,))
+    db.update(Invite, Invite.id == iid, revoked=1)
     db.audit(user["email"], "invite.revoked", row["email"], ip_of(request))
     return {"ok": True}
 
 
 @router.post("/api/users/{uid}/reset-link")
 def user_reset_link(uid: int, request: Request, user: dict = Depends(admin_only)):
-    u = db.one("SELECT * FROM users WHERE id=? AND disabled=0", (uid,))
+    u = db.get(User, User.id == uid, User.disabled == 0)
     if not u:
         raise HTTPException(404, "User not found or disabled")
     link = _send_reset(u)
@@ -274,11 +288,11 @@ def user_reset_link(uid: int, request: Request, user: dict = Depends(admin_only)
 
 # ---- two-factor ----------------------------------------------------------------------------------
 def _fresh(user: dict) -> dict:
-    return db.one("SELECT * FROM users WHERE id=?", (user["id"],))
+    return db.get(User, User.id == user["id"])
 
 
 def _recovery_left(uid: int) -> int:
-    return db.one("SELECT COUNT(*) AS n FROM recovery_codes WHERE user_id=? AND used_at IS NULL", (uid,))["n"]
+    return db.count(RecoveryCode, RecoveryCode.user_id == uid, RecoveryCode.used_at.is_(None))
 
 
 @router.get("/api/2fa/status")
@@ -294,16 +308,17 @@ def twofa_setup(user: dict = Depends(current_user)):
     if u["totp_enabled"]:
         raise HTTPException(400, "Two-factor authentication is already on")
     secret = totp.new_secret()
-    db.execute("UPDATE users SET totp_pending=? WHERE id=?", (secret, u["id"]))
+    db.update(User, User.id == u["id"], totp_pending=secret)
     uri = totp.otpauth_uri(secret, u["email"])
     return {"secret": secret, "uri": uri, "qr": qr.svg(uri)}
 
 
 def _store_recovery(uid: int) -> list:
     codes = totp.new_recovery_codes()
-    db.execute("DELETE FROM recovery_codes WHERE user_id=?", (uid,))
-    for c in codes:
-        db.execute("INSERT INTO recovery_codes(user_id,code_hash) VALUES(?,?)", (uid, totp.hash_recovery(c)))
+    with db.transaction() as tx:                      # old codes are only replaced if the new ones were stored
+        tx.delete(RecoveryCode, RecoveryCode.user_id == uid)
+        for c in codes:
+            tx.insert(RecoveryCode, user_id=uid, code_hash=totp.hash_recovery(c))
     return codes
 
 
@@ -323,8 +338,7 @@ def twofa_enable(body: CodeBody, request: Request, user: dict = Depends(current_
     if step is None:
         security.note_failure(key)
         raise HTTPException(400, "That code is not right. Check the time on your phone and try the next code.")
-    db.execute("UPDATE users SET totp_secret=?, totp_pending=NULL, totp_enabled=1, totp_last_step=? WHERE id=?",
-               (u["totp_pending"], step, u["id"]))
+    db.update(User, User.id == u["id"], totp_secret=u["totp_pending"], totp_pending=None, totp_enabled=1, totp_last_step=step)
     security.clear_failures(key)
     db.audit(u["email"], "2fa.enabled", "", ip_of(request))
     return {"recovery_codes": _store_recovery(u["id"])}
@@ -353,8 +367,8 @@ def twofa_disable(body: PwCodeBody, request: Request, user: dict = Depends(curre
     if security_cfg()["require_2fa"]:
         raise HTTPException(400, "Your admin requires two-factor authentication, so it cannot be turned off")
     _confirm_identity(u, body, request)
-    db.execute("UPDATE users SET totp_secret=NULL, totp_pending=NULL, totp_enabled=0, totp_last_step=0 WHERE id=?", (u["id"],))
-    db.execute("DELETE FROM recovery_codes WHERE user_id=?", (u["id"],))
+    db.update(User, User.id == u["id"], totp_secret=None, totp_pending=None, totp_enabled=0, totp_last_step=0)
+    db.delete(RecoveryCode, RecoveryCode.user_id == u["id"])
     db.audit(u["email"], "2fa.disabled", "", ip_of(request))
     return {"ok": True}
 
@@ -371,12 +385,12 @@ def twofa_recovery(body: PwCodeBody, request: Request, user: dict = Depends(curr
 
 @router.post("/api/users/{uid}/reset-2fa")
 def user_reset_2fa(uid: int, request: Request, user: dict = Depends(admin_only)):
-    u = db.one("SELECT * FROM users WHERE id=?", (uid,))
+    u = db.get(User, User.id == uid)
     if not u:
         raise HTTPException(404, "User not found")
-    db.execute("UPDATE users SET totp_secret=NULL, totp_pending=NULL, totp_enabled=0, totp_last_step=0 WHERE id=?", (uid,))
-    db.execute("DELETE FROM recovery_codes WHERE user_id=?", (uid,))
-    db.execute("DELETE FROM login_challenges WHERE user_id=?", (uid,))
+    db.update(User, User.id == uid, totp_secret=None, totp_pending=None, totp_enabled=0, totp_last_step=0)
+    db.delete(RecoveryCode, RecoveryCode.user_id == uid)
+    db.delete(LoginChallenge, LoginChallenge.user_id == uid)
     db.audit(user["email"], "2fa.reset_by_admin", u["email"], ip_of(request))
     return {"ok": True}
 
@@ -427,8 +441,8 @@ class TestBody(BaseModel):
 def email_test(body: TestBody, request: Request, user: dict = Depends(admin_only)):
     to = _email(body.to or user["email"])
     try:
-        mailer.send(to, "Nazar Ops test email", "If you can read this, email from Nazar Ops works.\n",
-                    "<p style='font-family:system-ui'>If you can read this, email from <b>Nazar Ops</b> works.</p>")
+        subject, text, html = mailer.test_email()
+        mailer.send(to, subject, text, html)
     except mailer.MailError as e:
         raise HTTPException(400, str(e))
     db.audit(user["email"], "email.test", to, ip_of(request))
@@ -447,5 +461,6 @@ class SecurityBody(BaseModel):
 @router.put("/api/security")
 def security_put(body: SecurityBody, request: Request, user: dict = Depends(admin_only)):
     db.sset("security_cfg", {"require_2fa": body.require_2fa})
+    security_cfg(fresh=True)
     db.audit(user["email"], "security.require_2fa", "on" if body.require_2fa else "off", ip_of(request))
     return security_cfg()

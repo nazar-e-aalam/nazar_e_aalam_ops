@@ -899,7 +899,7 @@
       var ta = h("textarea", {
           rows: 12,
           spellcheck: false,
-          placeholder: "KEY=value\nDATABASE_URL=postgres://…",
+          placeholder: "KEY=value\nDB_HOST=…",
           style: { minHeight: "240px" },
         }),
         note = h("input", {
@@ -1979,6 +1979,8 @@
     ["server", "Server"],
     ["webhook", "Webhook"],
     ["email", "Email"],
+    ["notifications", "Notifications"],
+    ["database", "Database"],
     ["users", "Users"],
     ["account", "Account"],
     ["audit", "Audit log"],
@@ -2027,6 +2029,8 @@
       server: tServer,
       webhook: tWebhook,
       email: tEmail,
+      notifications: function (b) { O.settingsTabs.notifications(b); },
+      database: function (b) { O.settingsTabs.database(b); },
       users: tUsers,
       account: tAccount,
       audit: tAudit,

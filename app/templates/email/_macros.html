@@ -1,0 +1,32 @@
+{% macro button(label, url) -%}
+<table role="presentation" cellpadding="0" cellspacing="0" style="margin:26px 0 8px 0;"><tr>
+  <td class="btn" align="center" style="background:#ffd60a;border-radius:10px;">
+    <a href="{{ url }}" style="display:inline-block;padding:13px 26px;font:700 15px/1 Manrope,'Segoe UI',Arial,sans-serif;color:#1a1400;text-decoration:none;border-radius:10px;">{{ label }}</a>
+  </td></tr></table>
+{%- endmacro %}
+
+{% macro p(text) -%}
+<p class="t" style="margin:0 0 14px 0;font:15px/1.65 Manrope,'Segoe UI',Arial,sans-serif;color:#2a3144;">{{ text }}</p>
+{%- endmacro %}
+
+{% macro small(text) -%}
+<p class="m" style="margin:14px 0 0 0;font:13px/1.6 Manrope,'Segoe UI',Arial,sans-serif;color:#667086;">{{ text }}</p>
+{%- endmacro %}
+
+{% macro fallback(url) -%}
+<p class="m" style="margin:18px 0 0 0;font:12px/1.6 Manrope,'Segoe UI',Arial,sans-serif;color:#667086;">Button not working? Paste this link into your browser:<br>
+<a href="{{ url }}" style="color:#1f6fe0;word-break:break-all;">{{ url }}</a></p>
+{%- endmacro %}
+
+{% macro facts(rows) -%}
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" class="box" style="margin:18px 0 6px 0;background:#f8fafd;border:1px solid #e3e7f0;border-radius:12px;">
+{% for k, v in rows %}<tr>
+  <td class="m" style="padding:10px 14px;width:34%;font:600 12px/1.4 Manrope,'Segoe UI',Arial,sans-serif;color:#667086;text-transform:uppercase;letter-spacing:.04em;vertical-align:top;{% if not loop.first %}border-top:1px solid #e3e7f0;{% endif %}">{{ k }}</td>
+  <td class="t" style="padding:10px 14px;font:14px/1.5 Manrope,'Segoe UI',Arial,sans-serif;color:#131826;vertical-align:top;word-break:break-word;{% if not loop.first %}border-top:1px solid #e3e7f0;{% endif %}">{{ v }}</td>
+</tr>{% endfor %}
+</table>
+{%- endmacro %}
+
+{% macro logbox(text) -%}
+<pre class="code" style="margin:16px 0 0 0;padding:14px;background:#0a0d13;border:1px solid #232938;border-radius:10px;color:#cfd5e4;font:12px/1.55 'JetBrains Mono',Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word;overflow:hidden;">{{ text }}</pre>
+{%- endmacro %}

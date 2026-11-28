@@ -7,7 +7,7 @@ One small FastAPI service that gives you:
 | `ops.<your-domain>` | **Ops panel** (login): run GitHub workflows with inputs, watch the whole workflow as a live "roots" graph, deploy the panel repo per commit, manage the admin panel's `.env`, publish app builds, users, audit log |
 | `<your-domain>/applications` | **Public downloads**: every app and every version, GitHub-releases style, no login |
 
-Plain HTML/CSS/JS on the front, FastAPI + SQLite on the back. No build step, no database server, no Node.
+Plain HTML/CSS/JS on the front, FastAPI + SQLAlchemy on the back with MySQL / MariaDB (installed and created for you). No build step, no Node. All logs go to the terminal (or `journalctl`), never to files.
 
 ---
 
@@ -22,7 +22,7 @@ sudo scripts/install.sh --domain example.com --email you@example.com --ssl
 
 The installer does everything, and is safe to re-run:
 
-1. installs `python3-venv`, `git`, `nginx` (and `certbot` with `--ssl`)
+1. installs `python3-venv`, `git`, `nginx`, **MariaDB** (and `certbot` with `--ssl`), starts MariaDB and **creates the database + user** with a random password
 2. creates a `nazar` system user and installs the app into `/opt/nazar-ops` with its own virtualenv
 3. writes `.env` (domain, seeded admin login, `OPS_HTTPS`)
 4. **generates and installs** the systemd services (`nazar-ops`, `nazar-panel`), the sudoers rule that lets the panel restart only that one service, and the nginx site (ops panel on `ops.example.com`, downloads on `example.com/applications`, your API/admin on `example.com`)
@@ -40,7 +40,7 @@ After the installer:
 
 Without HTTPS yet (`--ssl` omitted) the installer sets `OPS_HTTPS=false` so login works over plain http. After DNS works run `sudo certbot --nginx -d example.com -d ops.example.com`, set `OPS_HTTPS=true` in `/opt/nazar-ops/.env`, and `sudo systemctl restart nazar-ops`.
 
-Try it locally first: `scripts/setup.sh` then `scripts/dev.sh`, and open `http://localhost:8100/ops/` and `http://localhost:8100/applications`.
+Try it locally first: **`./run.sh`** (first run installs the libraries and MySQL, creates the database and `.env`, then starts with auto-reload; the first-login password is printed in the terminal). Open `http://localhost:8100/ops/` and `http://localhost:8100/applications`.
 
 ### GitHub token
 
@@ -53,6 +53,36 @@ Create a **fine-grained personal access token** (or a bot user's) with access to
 | Metadata | Read | required by GitHub |
 
 *Settings > GitHub* runs a live check (token valid, who it belongs to, expiry, each repo reachable, Actions readable, write access, API rate limit) and shows ✓ / ✗ with a reason for each.
+
+---
+
+## 1b. Database (MySQL / MariaDB)
+
+Everything the panel stores (users, sessions, settings, deployments and their output, releases, audit log) lives in one MySQL / MariaDB database. There is no `DATABASE_URL`: the connection is these lines in `.env`, which `scripts/setup.sh` (local) and `scripts/install.sh` (server) fill in after installing MariaDB and creating the database and user for you:
+
+```
+OPS_DB_HOST=127.0.0.1
+OPS_DB_PORT=3306
+OPS_DB_NAME=nazar_ops
+OPS_DB_USER=nazar_ops
+OPS_DB_PASSWORD=<random, generated>
+```
+
+* The database, tables, missing columns and indexes are created automatically on start (`app/db/models.py` is the schema, `app/db/db.py` the engine). If MySQL is still starting, the panel waits up to 30 s.
+* **External / managed MySQL:** put its host, user, password and name in `.env` (`OPS_DB_HOST` not `127.0.0.1`) and run `scripts/setup.sh --no-db`. Nothing is installed locally.
+* Per-server "external database" settings were removed from deployments: your deployed app keeps its own `DB_*` variables in the **Environment** tab like any other variable.
+
+## 1c. Automatic server setup and alerts
+
+Granting sudo access (*Servers > guide > Access check > Grant access*) immediately starts **server setup**, with a live log:
+access check → system packages (apt/dnf/yum: python3, venv, pip, git, curl, build tools) → Python check (>= 3.10 with venv; installs 3.12 when needed) → deploy folders → clone the panel repo → virtualenv + dependencies → **your test command** → cleanup. Nothing touches the running version. The sudo password is used once, kept in memory only and never logged; with root or passwordless sudo, use *Set up this server*.
+
+If setup, a deployment or its tests fail, the panel adds a notification (bell icon) and emails all admins with the failing stage and the last output lines (*Settings > Notifications*: extra recipients, "also on success"). Email templates (invite, password reset, alerts) are HTML with a plain-text part and dark-mode support, in `app/templates/email/`; preview them under *Settings > Notifications*.
+
+## 1d. Logs
+
+Nothing is written to log files. The panel and every deployment / server-setup run print to the terminal as they happen (`[run #12] ...`):
+locally in the window running `./run.sh`, on a server with `journalctl -u nazar-ops -f`. The live log view in the panel shows the same output, and finished runs keep it in the database. Set `OPS_LOG_LEVEL=DEBUG` for more detail.
 
 ---
 
@@ -116,11 +146,13 @@ Passwords are scrypt-hashed, sessions are HttpOnly cookies (SameSite=Lax, Secure
 |---|---|---|
 | `OPS_ROOT_DOMAIN` | `localhost` | your domain; public site at `/applications` |
 | `OPS_SUBDOMAIN` | `ops` | panel host is `<sub>.<root>` |
-| `OPS_HTTPS` | `true` | marks cookies Secure and sends HSTS; `false` only locally |
+| `OPS_HTTPS` | `false` locally, `true` on a domain | marks cookies Secure and sends HSTS; `false` only locally |
 | `OPS_ADMIN_EMAIL` / `OPS_ADMIN_PASSWORD` / `OPS_ADMIN_NAME` | | seeded admin (only when the DB is empty) |
 | `OPS_GITHUB_TOKEN` | | fallback token (a token saved in the panel wins) |
 | `OPS_GITHUB_ORG` / `OPS_APP_REPO` / `OPS_PANEL_REPO` | `nazar-e-aalam` / `nazar_e_aalam_app` / `nazar_e_aalam_panel` | |
-| `OPS_DATA_DIR` | `./data` | database, logs, uploaded builds |
+| `OPS_DB_HOST` / `OPS_DB_PORT` / `OPS_DB_NAME` / `OPS_DB_USER` / `OPS_DB_PASSWORD` | `127.0.0.1` / `3306` / `nazar_ops` / `nazar_ops` / generated | MySQL connection (see 1b); optional `OPS_DB_SOCKET` |
+| `OPS_DATA_DIR` | `./data` | uploaded builds and staging (no logs, no database file) |
+| `OPS_LOG_LEVEL` | `INFO` | terminal log level |
 | `OPS_MAX_UPLOAD_MB` | `800` | per file limit (also raise nginx `client_max_body_size`) |
 | `OPS_SESSION_HOURS` | `168` | login lifetime |
 | `OPS_DEV` | auto (`true` on localhost) | also serve the panel at `/ops` on any host, for local testing |
@@ -133,7 +165,7 @@ Passwords are scrypt-hashed, sessions are HttpOnly cookies (SameSite=Lax, Secure
 
 All deploy settings (branch, commands, health URL, retention, polling) are edited in the panel, not here.
 
-**Back up** `data/` (SQLite DB + uploaded builds). Everything else can be re-created from this folder and GitHub.
+**Back up** the MySQL database (`mysqldump nazar_ops`) and `data/` (uploaded builds). Everything else can be re-created from this folder and GitHub.
 
 ---
 
@@ -146,7 +178,7 @@ app/
   manage.py          recovery CLI: reset-password, disable-2fa, create-admin, list-users
   core/              foundations
     config.py          env vars (incl. gh-proxy settings)
-    db.py              SQLite schema, migrations + helpers
+    logs.py            terminal logging + banner (no files)
     security.py        password hashing, sessions, login throttle, admin seed
     envstore.py        versioned .env
     totp.py            TOTP (RFC 6238) + recovery codes
@@ -167,7 +199,8 @@ web/
   ops/             index.html, app.js (router, overview, workflows, runs), auth.js (sign-in, invite, reset, 2FA screens), pages.js
                    (deploy, env, releases, settings), roots.js + roots.css (the graph)
   public/          the downloads site
-scripts/           install.sh (full server setup), setup.sh, dev.sh
+run.sh              start locally (auto-setup on first run)
+scripts/           install.sh (full server setup), setup.sh (venv + libs + MySQL + .env), dev.sh, _lib.sh
 ```
 
 ---
@@ -189,6 +222,7 @@ When asking Claude to continue, say which file(s) you want changed and paste the
 | Symptom | Fix |
 |---|---|
 | "Not found (or the token cannot see this repository)" | token lacks access to that repo, re-check in Settings > GitHub |
+| "Cannot connect to MySQL" on start | run `scripts/setup.sh` again (installs / starts MariaDB, resets the DB user's password to the one in `.env`) |
 | Run button says token is read-only | add **Actions: write** (fine-grained) or the `workflow` scope (classic) |
 | Deploy fails at *Restart* with a sudo password prompt | sudoers rule missing or wrong service name |
 | Deploy fails at *Tests* with "No module named pytest" | add `pytest` to the panel repo's `requirements.txt` |
@@ -250,10 +284,10 @@ Clicking your name at the bottom of the sidebar opens Account settings.
 1. **Connection**: address, SSH user (a normal user such as `deploy`), port, optional deploy folder / restart command / health URL for that server.
 2. **SSH key**: the panel creates an ed25519 key (private half stays in `data/ssh`, mode 600) and shows one command that adds the public key to the server's `authorized_keys`. You can also paste your own key (no passphrase).
 3. **Access check**: logs in and tests Python + venv, `tar`, write access to the deploy folder, free disk and **sudo for the restart command**. If sudo asks for a password, press **Grant access** and type the password once: the panel installs a sudoers rule for exactly that command (`/etc/sudoers.d/zz-nazar-ops-<user>`) and does not store the password. A manual command is shown too. The first login pins the server's host key; later connections use strict checking (*Forget host key* after a reinstall).
-4. **Database**: *Local*, or *External* MySQL / MariaDB / PostgreSQL (host, port, name, user, password, SSL). At every deployment the values are written into that server's `.env` (`DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DATABASE_URL`; names configurable). **Test connection** checks reachability from the panel *and* from the target server, and logs in for MySQL.
+4. **Server setup**: runs automatically after sudo is granted (see 1c): packages, Python check, deploy folder, test build.
 
 How a remote deploy works: the commit is fetched on the ops server (via gh-proxy), the `.env` is written, the release is streamed over SSH (`tar`), then virtualenv, install, tests, atomic `current` switch, restart (with sudo) and the health check run **on the remote server**. Failure restores the previous release there. Rollback and release lists are per server.
 
-**Nothing deploys until it is ready.** Deployments (manual, webhook, auto) are blocked while the server has not passed the access check, an external database is incomplete, no `.env` was added, or a required key is empty. Required keys: *Settings → Deploy → Required environment keys* plus every key in your repo's `.env.example` that has no value. The Deployments page lists exactly what to fix. Turn the rule off with *Block deployments until the environment is complete*.
+**Nothing deploys until it is ready.** Deployments (manual, webhook, auto) are blocked while the server has not passed the access check, no `.env` was added, or a required key is empty. Required keys: *Settings → Deploy → Required environment keys* plus every key in your repo's `.env.example` that has no value. The Deployments page lists exactly what to fix. Turn the rule off with *Block deployments until the environment is complete*.
 
 Auto deploy and webhooks go to the server chosen on the Servers page ("Use for auto deploy"). Needs `openssh-client` on the ops server (`sudo apt install openssh-client`).
